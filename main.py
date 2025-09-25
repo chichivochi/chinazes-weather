@@ -117,7 +117,6 @@ async def setcity(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id,
             data=city,
             name=name,
-            replace_existing=True,
         )
 
         await update.message.reply_text(
