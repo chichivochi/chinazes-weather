@@ -6,23 +6,22 @@ from zoneinfo import ZoneInfo
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ---- ЛОГИ (видно в Render) ----
+# ---------- ЛОГИ ----------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
+log = logging.getLogger("weather-bot")
 
-# ---- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----
+# ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEATHER_KEY = os.getenv("OPENWEATHER_API_KEY")
 
-# Часовой пояс и время автосообщения
 TZ = ZoneInfo("Europe/Prague")
-SEND_HOUR = 7  # 07:00
+SEND_HOUR = 7  # 07:00 местного времени
 
-# ---- ПОГОДА ----
+# ---------- ПОГОДА ----------
 def fetch_weather(city: str):
-    """Возвращает словарь с погодой или None, если город не найден."""
     url = "https://api.openweathermap.org/data/2.5/weather"
     params = {"q": city, "appid": WEATHER_KEY, "units": "metric", "lang": "ru"}
     try:
@@ -36,17 +35,15 @@ def fetch_weather(city: str):
             "feels": float(data["main"]["feels_like"]),
             "desc": str(data["weather"][0]["description"]).capitalize(),
         }
-    except Exception:
+    except Exception as e:
+        log.exception("fetch_weather error: %s", e)
         return None
 
 def clothing_advice(temp: float, feels: float, desc: str) -> str:
-    """Простая логика рекомендаций по одежде."""
     d = desc.lower()
     lines = []
-
-    # Базово по ощущаемой температуре
     if feels < -5:
-        lines.append("Очень холодно 🥶: тёплая куртка/пуховик, шапка, перчатки, шарф.")
+        lines.append("Очень холодно 🥶: тёплый пуховик, шапка, перчатки, шарф.")
     elif feels < 5:
         lines.append("Холодно ❄️: тёплая куртка, шапка, перчатки.")
     elif feels < 12:
@@ -55,17 +52,14 @@ def clothing_advice(temp: float, feels: float, desc: str) -> str:
         lines.append("Умеренно 🌤: футболка + лёгкая накидка по желанию.")
     else:
         lines.append("Тепло ☀️: лёгкая одежда, пейте воду.")
-
-    # Доп. условия
     if "дожд" in d or "морос" in d:
-        lines.append("Возьми зонт ☔️ или дождевик.")
+        lines.append("Возьми зонт ☔️.")
     if "снег" in d:
-        lines.append("Незаменима непромокаемая обувь и перчатки 🧤.")
-    if "гроза" in d:
-        lines.append("Избегай открытых пространств и высоких деревьев 🌩.")
+        lines.append("Непромокаемая обувь и перчатки 🧤.")
     if "ветер" in d:
         lines.append("Ветрозащитная куртка пригодится 🌬.")
-
+    if "гроза" in d:
+        lines.append("Избегай открытых мест и высоких деревьев 🌩.")
     return "\n".join(lines)
 
 def format_report(city: str) -> str:
@@ -80,67 +74,71 @@ def format_report(city: str) -> str:
         f"👕 Советы по одежде:\n{tips}"
     )
 
-# ---- ВСПОМОГАТЕЛЬНОЕ: хранение города в job_queue ----
-def get_saved_city(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str | None:
-    jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-    if not jobs:
-        return None
-    # city хранится в job.data
-    return jobs[0].data
-
-# ---- КОМАНДЫ ----
+# ---------- КОМАНДЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [["/now", "/today", "/setcity Praha"]]
     await update.message.reply_text(
-        "Привет! Я про погоду и одежду. "
-        "Задай город: /setcity <город>\n"
+        "Привет! Я про погоду и одежду.\n"
+        "Сначала задай город: /setcity <город>\n"
         "Кнопки ниже помогут 👇",
-        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
-    )
-
-async def setcity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Напиши так: /setcity Praha")
-        return
-    city = " ".join(context.args)
-    chat_id = update.effective_chat.id
-
-    # удалим старую задачу (если была) и создадим новую
-    for j in context.job_queue.get_jobs_by_name(str(chat_id)):
-        j.schedule_removal()
-
-    context.job_queue.run_daily(
-        callback=send_daily,
-        time=dtime(hour=SEND_HOUR, minute=0, tzinfo=TZ),
-        chat_id=chat_id,
-        data=city,              # тут хранится выбранный город
-        name=str(chat_id),
-        replace_existing=True,
-    )
-    await update.message.reply_text(
-        f"Город сохранён: {city}\n"
-        f"Теперь каждый день в {SEND_HOUR:02d}:00 пришлю прогноз и советы."
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True),
     )
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    city = get_saved_city(context, chat_id)
+    city = context.chat_data.get("city")
     if not city:
         await update.message.reply_text("Сначала задай город: /setcity <город>")
         return
     await update.message.reply_text(format_report(city))
 
 async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # короткая команда — то же, что /today
     await today(update, context)
 
-# ---- ДНЕВНАЯ РАССЫЛКА ----
+async def setcity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not context.args:
+            await update.message.reply_text("Напиши так: /setcity Praha")
+            return
+        city = " ".join(context.args).strip()
+        chat_id = update.effective_chat.id
+
+        # 1) сохраняем город «на всякий» (его видят /now и /today)
+        context.chat_data["city"] = city
+
+        # 2) снимаем старую ежедневную задачу (если была)
+        name = f"daily-{chat_id}"
+        for j in context.job_queue.get_jobs_by_name(name):
+            j.schedule_removal()
+
+        # 3) создаём новую ежедневную задачу на 07:00
+        context.job_queue.run_daily(
+            callback=send_daily,
+            time=dtime(hour=SEND_HOUR, minute=0, tzinfo=TZ),
+            chat_id=chat_id,
+            data=city,
+            name=name,
+            replace_existing=True,
+        )
+
+        await update.message.reply_text(
+            f"✅ Город сохранён: {city}\n"
+            f"Теперь каждый день в {SEND_HOUR:02d}:00 пришлю прогноз и советы."
+        )
+        log.info("City set for chat %s: %s", chat_id, city)
+    except Exception as e:
+        log.exception("setcity error: %s", e)
+        await update.message.reply_text("⚠️ Ошибка при сохранении города. Попробуй ещё раз.")
+
+# ---------- ДНЕВНАЯ РАССЫЛКА ----------
 async def send_daily(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
-    city = context.job.data
-    await context.bot.send_message(chat_id=chat_id, text=format_report(city))
+    city = context.job.data or "Praha"
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=format_report(city))
+    except Exception as e:
+        log.exception("send_daily error: %s", e)
 
-# ---- ЗАПУСК ----
+# ---------- ЗАПУСК ----------
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
