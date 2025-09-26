@@ -19,30 +19,29 @@ from telegram.ext import (
     filters,
 )
 
-# ---------------- ЛОГИ ----------------
+# ------------ ЛОГИ ------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("weather-bot")
 
-# ---------------- КЛЮЧИ ----------------
+# ------------ КЛЮЧИ/НАСТРОЙКИ ------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OW_KEY = os.getenv("OPENWEATHER_API_KEY")
+TZ = ZoneInfo("Europe/Prague")  # для «завтра» по местному времени
 
-# Часовой пояс (для человеко-понятного выбора «завтра»)
-TZ = ZoneInfo("Europe/Prague")
-
-
-# =============== ПОМОЩЬНИКИ ===============
+# ============ ВСПОМОГАТЕЛЬНОЕ ============
 def clothing_advice(temp: float, feels: float, desc: str) -> str:
+    """Советы по одежде с предупреждениями о дожде/снеге/ветре/грозе."""
     d = desc.lower()
     tips = []
-    # базово по «ощущается»
+
+    # по «ощущается»
     if feels < -5:
         tips.append("Очень холодно 🥶: тёплый пуховик, шапка, перчатки, шарф.")
     elif feels < 5:
-        tips.append("Холодно ❄️: тёплая куртка/шапка/перчатки.")
+        tips.append("Холодно ❄️: тёплая куртка, шапка, перчатки.")
     elif feels < 12:
         tips.append("Прохладно 🧥: лёгкая куртка/кофта.")
     elif feels < 20:
@@ -50,15 +49,15 @@ def clothing_advice(temp: float, feels: float, desc: str) -> str:
     else:
         tips.append("Тепло ☀️: лёгкая одежда, пей воду.")
 
-    # условия по описанию
-    if "дожд" in d or "морос" in d:
-        tips.append("Возьми зонт ☔️ или дождевик.")
-    if "снег" in d:
-        tips.append("Непромокаемая обувь и перчатки 🧤.")
-    if "ветер" in d:
-        tips.append("Ветрозащитная куртка пригодится 🌬.")
-    if "гроза" in d:
-        tips.append("Избегай открытых мест и высоких деревьев 🌩.")
+    # дополнительные предупреждения
+    if ("rain" in d) or ("дожд" in d) or ("морос" in d):
+        tips.append("🌧 Ожидается дождь — возьми зонт или дождевик.")
+    if "snow" in d or "снег" in d:
+        tips.append("❄ Возможен снег — тёплая непромокаемая обувь и перчатки.")
+    if "thunderstorm" in d or "гроза" in d:
+        tips.append("⛈ Гроза — избегай открытых мест и высотных деревьев.")
+    if "wind" in d or "ветер" in d:
+        tips.append("💨 Ветрено — пригодится ветрозащитная куртка/капюшон.")
 
     return "\n".join(tips)
 
@@ -73,7 +72,8 @@ def kb() -> ReplyKeyboardMarkup:
     )
 
 
-# =============== ЗАПРОСЫ К OWM ===============
+# ============ OPENWEATHER ============
+
 def current_by_city(city: str) -> Optional[Tuple[str, float, float, str]]:
     url = "https://api.openweathermap.org/data/2.5/weather"
     p = {"q": city, "appid": OW_KEY, "units": "metric", "lang": "ru"}
@@ -111,6 +111,7 @@ def current_by_coords(lat: float, lon: float) -> Optional[Tuple[str, float, floa
 
 
 def tomorrow_by_city(city: str) -> Optional[Tuple[str, float, float, str]]:
+    """Прогноз на завтра: минимум/максимум и описание около полудня."""
     url = "https://api.openweathermap.org/data/2.5/forecast"
     p = {"q": city, "appid": OW_KEY, "units": "metric", "lang": "ru"}
     try:
@@ -119,17 +120,12 @@ def tomorrow_by_city(city: str) -> Optional[Tuple[str, float, float, str]]:
             return None
         name = r["city"]["name"]
         target_date = (datetime.now(TZ) + timedelta(days=1)).date()
-
-        day_points = [
-            i for i in r["list"]
-            if datetime.fromtimestamp(i["dt"], TZ).date() == target_date
-        ]
-        if not day_points:
+        pts = [i for i in r["list"] if datetime.fromtimestamp(i["dt"], TZ).date() == target_date]
+        if not pts:
             return None
-
-        tmin = min(i["main"]["temp_min"] for i in day_points)
-        tmax = max(i["main"]["temp_max"] for i in day_points)
-        near12 = min(day_points, key=lambda i: abs(datetime.fromtimestamp(i["dt"], TZ).hour - 12))
+        tmin = min(i["main"]["temp_min"] for i in pts)
+        tmax = max(i["main"]["temp_max"] for i in pts)
+        near12 = min(pts, key=lambda i: abs(datetime.fromtimestamp(i["dt"], TZ).hour - 12))
         desc = near12["weather"][0]["description"]
         return name, float(tmin), float(tmax), str(desc)
     except Exception as e:
@@ -146,17 +142,12 @@ def tomorrow_by_coords(lat: float, lon: float) -> Optional[Tuple[str, float, flo
             return None
         name = r["city"]["name"]
         target_date = (datetime.now(TZ) + timedelta(days=1)).date()
-
-        day_points = [
-            i for i in r["list"]
-            if datetime.fromtimestamp(i["dt"], TZ).date() == target_date
-        ]
-        if not day_points:
+        pts = [i for i in r["list"] if datetime.fromtimestamp(i["dt"], TZ).date() == target_date]
+        if not pts:
             return None
-
-        tmin = min(i["main"]["temp_min"] for i in day_points)
-        tmax = max(i["main"]["temp_max"] for i in day_points)
-        near12 = min(day_points, key=lambda i: abs(datetime.fromtimestamp(i["dt"], TZ).hour - 12))
+        tmin = min(i["main"]["temp_min"] for i in pts)
+        tmax = max(i["main"]["temp_max"] for i in pts)
+        near12 = min(pts, key=lambda i: abs(datetime.fromtimestamp(i["dt"], TZ).hour - 12))
         desc = near12["weather"][0]["description"]
         return name, float(tmin), float(tmax), str(desc)
     except Exception as e:
@@ -164,7 +155,7 @@ def tomorrow_by_coords(lat: float, lon: float) -> Optional[Tuple[str, float, flo
         return None
 
 
-# =============== ОТЧЁТЫ ===============
+# ============ ФОРМАТИРОВАНИЕ ============
 def format_now(name: str, temp: float, feels: float, desc: str) -> str:
     return (
         f"🌤 Сейчас в {name}:\n"
@@ -184,14 +175,13 @@ def format_tomorrow(name: str, tmin: float, tmax: float, desc: str) -> str:
     )
 
 
-# =============== ХЭНДЛЕРЫ ===============
+# ============ ХЭНДЛЕРЫ ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # значения по умолчанию
     context.chat_data.setdefault("mode", "city")   # city|geo
     context.chat_data.setdefault("city", "Praha")
     await update.message.reply_text(
         "Выбери: today / tomorrow.\n"
-        "Ниже можно переключить источник: Praha или 📍 Моя геолокация.",
+        "Ниже — источник: Praha или 📍 Моя геолокация.",
         reply_markup=kb(),
     )
 
@@ -231,29 +221,24 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопок-надписей: today / tomorrow / Praha."""
     text = (update.message.text or "").strip().lower()
 
     if text == "today":
         await cmd_today(update, context)
         return
-
     if text == "tomorrow":
         await cmd_tomorrow(update, context)
         return
-
     if text == "praha":
         context.chat_data["mode"] = "city"
         context.chat_data["city"] = "Praha"
         await update.message.reply_text("Источник: Praha ✅", reply_markup=kb())
         return
 
-    # прочий текст
-    await update.message.reply_text("Нажми кнопку: today / tomorrow, или выбери источник ниже.", reply_markup=kb())
+    await update.message.reply_text("Нажми кнопку: today / tomorrow, либо выбери источник ниже.", reply_markup=kb())
 
 
 async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пользователь отправил геопозицию с кнопки '📍 Моя геолокация'."""
     loc = update.message.location
     if not loc:
         return
@@ -262,7 +247,7 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Источник: текущая геолокация ✅", reply_markup=kb())
 
 
-# --- регистрация командного меню у Telegram ---
+# зарегистрируем команды в меню Telegram
 async def post_init(app):
     await app.bot.set_my_commands([
         BotCommand("start", "показать клавиатуру"),
@@ -271,7 +256,7 @@ async def post_init(app):
     ])
 
 
-# =============== ЗАПУСК ===============
+# ============ ЗАПУСК ============
 def main():
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
 
