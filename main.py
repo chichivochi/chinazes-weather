@@ -1,10 +1,10 @@
 import os
 import logging
-import requests
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from typing import Optional, Tuple
+from zoneinfo import ZoneInfo
 
+import requests
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -19,47 +19,55 @@ from telegram.ext import (
     filters,
 )
 
-# ------------ ЛОГИ ------------
+# ---------- ЛОГИ ----------
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("weather-bot")
+log = logging.getLogger("chinazes-weather")
 
-# ------------ КЛЮЧИ/НАСТРОЙКИ ------------
+# ---------- КЛЮЧИ ----------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OW_KEY = os.getenv("OPENWEATHER_API_KEY")
-TZ = ZoneInfo("Europe/Prague")  # для «завтра» по местному времени
 
-# ============ ВСПОМОГАТЕЛЬНОЕ ============
-def clothing_advice(temp: float, feels: float, desc: str) -> str:
-    """Советы по одежде с предупреждениями о дожде/снеге/ветре/грозе."""
-    d = desc.lower()
+# часовой пояс для "завтра"
+TZ = ZoneInfo("Europe/Prague")
+
+
+# ---------- СОВЕТЫ ПО ОДЕЖДЕ ----------
+def get_clothing_advice(temp_c: float, description: str, wind_speed: float = 0) -> str:
+    d = (description or "").lower()
     tips = []
 
-    # по «ощущается»
-    if feels < -5:
-        tips.append("Очень холодно 🥶: тёплый пуховик, шапка, перчатки, шарф.")
-    elif feels < 5:
-        tips.append("Холодно ❄️: тёплая куртка, шапка, перчатки.")
-    elif feels < 12:
-        tips.append("Прохладно 🧥: лёгкая куртка/кофта.")
-    elif feels < 20:
-        tips.append("Умеренно 🌤: футболка + лёгкая накидка.")
+    # по температуре (по «факту», можно заменить на feels_like если хочешь)
+    if temp_c <= 0:
+        tips.append("Очень холодно 🥶. Зимняя куртка, шапка, шарф и перчатки.")
+    elif 0 < temp_c <= 5:
+        tips.append("Холодно ❄️. Тёплая куртка, шапка и перчатки.")
+    elif 5 < temp_c <= 15:
+        tips.append("Прохладно 🌬. Куртка или худи, закрытая обувь.")
+    elif 15 < temp_c <= 25:
+        tips.append("Комфортно 🙂. Футболка и лёгкие брюки/джинсы.")
     else:
-        tips.append("Тепло ☀️: лёгкая одежда, пей воду.")
+        tips.append("Жарко ☀️. Лёгкая одежда, шорты, пейте больше воды.")
 
-    # дополнительные предупреждения
-    if ("rain" in d) or ("дожд" in d) or ("морос" in d):
-        tips.append("🌧 Ожидается дождь — возьми зонт или дождевик.")
-    if "snow" in d or "снег" in d:
-        tips.append("❄ Возможен снег — тёплая непромокаемая обувь и перчатки.")
-    if "thunderstorm" in d or "гроза" in d:
-        tips.append("⛈ Гроза — избегай открытых мест и высотных деревьев.")
-    if "wind" in d or "ветер" in d:
-        tips.append("💨 Ветрено — пригодится ветрозащитная куртка/капюшон.")
+    # по осадкам/небу
+    if "дожд" in d or "rain" in d or "морос" in d:
+        tips.append("Возьми зонт ☔️ или дождевик.")
+    if "снег" in d or "snow" in d:
+        tips.append("Тёплая непромокаемая обувь и перчатки ❄️.")
+    if "гроза" in d or "thunderstorm" in d:
+        tips.append("⛈ Избегай открытых мест и высоких деревьев.")
+    if "обла" in d or "cloud" in d:
+        tips.append("Пасмурно — пригодится лёгкая куртка.")
+    if "ясно" in d or "clear" in d:
+        tips.append("Ясно 🌞 — солнечные очки будут кстати.")
 
-    return "\n".join(tips)
+    # по ветру
+    if wind_speed >= 8:
+        tips.append("Сильный ветер 💨 — надень ветровку/капюшон.")
+
+    return " ".join(tips)
 
 
 def kb() -> ReplyKeyboardMarkup:
@@ -72,9 +80,9 @@ def kb() -> ReplyKeyboardMarkup:
     )
 
 
-# ============ OPENWEATHER ============
-
-def current_by_city(city: str) -> Optional[Tuple[str, float, float, str]]:
+# ---------- ЗАПРОСЫ К OPENWEATHER ----------
+def current_by_city(city: str) -> Optional[Tuple[str, float, float, float, str]]:
+    """Возвращает: name, temp, feels_like, wind_speed, description"""
     url = "https://api.openweathermap.org/data/2.5/weather"
     p = {"q": city, "appid": OW_KEY, "units": "metric", "lang": "ru"}
     try:
@@ -85,6 +93,7 @@ def current_by_city(city: str) -> Optional[Tuple[str, float, float, str]]:
             r["name"],
             float(r["main"]["temp"]),
             float(r["main"]["feels_like"]),
+            float(r.get("wind", {}).get("speed", 0.0)),
             str(r["weather"][0]["description"]),
         )
     except Exception as e:
@@ -92,7 +101,7 @@ def current_by_city(city: str) -> Optional[Tuple[str, float, float, str]]:
         return None
 
 
-def current_by_coords(lat: float, lon: float) -> Optional[Tuple[str, float, float, str]]:
+def current_by_coords(lat: float, lon: float) -> Optional[Tuple[str, float, float, float, str]]:
     url = "https://api.openweathermap.org/data/2.5/weather"
     p = {"lat": lat, "lon": lon, "appid": OW_KEY, "units": "metric", "lang": "ru"}
     try:
@@ -103,6 +112,7 @@ def current_by_coords(lat: float, lon: float) -> Optional[Tuple[str, float, floa
             r["name"],
             float(r["main"]["temp"]),
             float(r["main"]["feels_like"]),
+            float(r.get("wind", {}).get("speed", 0.0)),
             str(r["weather"][0]["description"]),
         )
     except Exception as e:
@@ -110,8 +120,8 @@ def current_by_coords(lat: float, lon: float) -> Optional[Tuple[str, float, floa
         return None
 
 
-def tomorrow_by_city(city: str) -> Optional[Tuple[str, float, float, str]]:
-    """Прогноз на завтра: минимум/максимум и описание около полудня."""
+def tomorrow_by_city(city: str) -> Optional[Tuple[str, float, float, float, str]]:
+    """Возвращает прогноз на завтра: name, tmin, tmax, wind_noon, desc_noon"""
     url = "https://api.openweathermap.org/data/2.5/forecast"
     p = {"q": city, "appid": OW_KEY, "units": "metric", "lang": "ru"}
     try:
@@ -120,20 +130,25 @@ def tomorrow_by_city(city: str) -> Optional[Tuple[str, float, float, str]]:
             return None
         name = r["city"]["name"]
         target_date = (datetime.now(TZ) + timedelta(days=1)).date()
+
         pts = [i for i in r["list"] if datetime.fromtimestamp(i["dt"], TZ).date() == target_date]
         if not pts:
             return None
+
         tmin = min(i["main"]["temp_min"] for i in pts)
         tmax = max(i["main"]["temp_max"] for i in pts)
+        # точка, ближайшая к полудню
         near12 = min(pts, key=lambda i: abs(datetime.fromtimestamp(i["dt"], TZ).hour - 12))
         desc = near12["weather"][0]["description"]
-        return name, float(tmin), float(tmax), str(desc)
+        wind = float(near12.get("wind", {}).get("speed", 0.0))
+
+        return name, float(tmin), float(tmax), wind, str(desc)
     except Exception as e:
         log.exception("tomorrow_by_city error: %s", e)
         return None
 
 
-def tomorrow_by_coords(lat: float, lon: float) -> Optional[Tuple[str, float, float, str]]:
+def tomorrow_by_coords(lat: float, lon: float) -> Optional[Tuple[str, float, float, float, str]]:
     url = "https://api.openweathermap.org/data/2.5/forecast"
     p = {"lat": lat, "lon": lon, "appid": OW_KEY, "units": "metric", "lang": "ru"}
     try:
@@ -142,42 +157,50 @@ def tomorrow_by_coords(lat: float, lon: float) -> Optional[Tuple[str, float, flo
             return None
         name = r["city"]["name"]
         target_date = (datetime.now(TZ) + timedelta(days=1)).date()
+
         pts = [i for i in r["list"] if datetime.fromtimestamp(i["dt"], TZ).date() == target_date]
         if not pts:
             return None
+
         tmin = min(i["main"]["temp_min"] for i in pts)
         tmax = max(i["main"]["temp_max"] for i in pts)
         near12 = min(pts, key=lambda i: abs(datetime.fromtimestamp(i["dt"], TZ).hour - 12))
         desc = near12["weather"][0]["description"]
-        return name, float(tmin), float(tmax), str(desc)
+        wind = float(near12.get("wind", {}).get("speed", 0.0))
+
+        return name, float(tmin), float(tmax), wind, str(desc)
     except Exception as e:
         log.exception("tomorrow_by_coords error: %s", e)
         return None
 
 
-# ============ ФОРМАТИРОВАНИЕ ============
-def format_now(name: str, temp: float, feels: float, desc: str) -> str:
+# ---------- ФОРМАТЫ ОТВЕТА ----------
+def fmt_now(name: str, temp: float, feels: float, wind: float, desc: str) -> str:
+    advice = get_clothing_advice(temp, desc, wind)
     return (
         f"🌤 Сейчас в {name}:\n"
         f"Температура: {round(temp)}°C (ощущается {round(feels)}°C)\n"
+        f"Ветер: {round(wind)} м/с\n"
         f"Описание: {desc.capitalize()}\n\n"
-        f"👕 Советы:\n{clothing_advice(temp, feels, desc)}"
+        f"👕 Совет: {advice}"
     )
 
 
-def format_tomorrow(name: str, tmin: float, tmax: float, desc: str) -> str:
+def fmt_tomorrow(name: str, tmin: float, tmax: float, wind_noon: float, desc_noon: str) -> str:
     mid = (tmin + tmax) / 2
+    advice = get_clothing_advice(mid, desc_noon, wind_noon)
     return (
         f"📅 Завтра в {name}:\n"
-        f"Мин/Макс: {round(tmin)}°C / {round(tmax)}°C\n"
-        f"Описание: {desc.capitalize()}\n\n"
-        f"👕 Советы:\n{clothing_advice(mid, mid, desc)}"
+        f"Мин/макс: {round(tmin)}°C / {round(tmax)}°C\n"
+        f"Ветер (около полудня): {round(wind_noon)} м/с\n"
+        f"Описание: {desc_noon.capitalize()}\n\n"
+        f"👕 Совет: {advice}"
     )
 
 
-# ============ ХЭНДЛЕРЫ ============
+# ---------- ХЭНДЛЕРЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data.setdefault("mode", "city")   # city|geo
+    context.chat_data.setdefault("mode", "city")   # city | geo
     context.chat_data.setdefault("city", "Praha")
     await update.message.reply_text(
         "Выбери: today / tomorrow.\n"
@@ -190,34 +213,34 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.chat_data.get("mode", "city")
     if mode == "city":
         city = context.chat_data.get("city", "Praha")
-        cur = current_by_city(city)
+        res = current_by_city(city)
     else:
         coords = context.chat_data.get("coords")
-        cur = current_by_coords(*coords) if coords else None
+        res = current_by_coords(*coords) if coords else None
 
-    if not cur:
-        await update.message.reply_text("Не получилось получить погоду. Попробуй снова.", reply_markup=kb())
+    if not res:
+        await update.message.reply_text("Не получилось получить погоду. Попробуй ещё раз.", reply_markup=kb())
         return
 
-    name, temp, feels, desc = cur
-    await update.message.reply_text(format_now(name, temp, feels, desc), reply_markup=kb())
+    name, temp, feels, wind, desc = res
+    await update.message.reply_text(fmt_now(name, temp, feels, wind, desc), reply_markup=kb())
 
 
 async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.chat_data.get("mode", "city")
     if mode == "city":
         city = context.chat_data.get("city", "Praha")
-        tw = tomorrow_by_city(city)
+        res = tomorrow_by_city(city)
     else:
         coords = context.chat_data.get("coords")
-        tw = tomorrow_by_coords(*coords) if coords else None
+        res = tomorrow_by_coords(*coords) if coords else None
 
-    if not tw:
-        await update.message.reply_text("Не получилось получить прогноз на завтра. Попробуй снова.", reply_markup=kb())
+    if not res:
+        await update.message.reply_text("Не получилось получить прогноз на завтра.", reply_markup=kb())
         return
 
-    name, tmin, tmax, desc = tw
-    await update.message.reply_text(format_tomorrow(name, tmin, tmax, desc), reply_markup=kb())
+    name, tmin, tmax, wind_noon, desc_noon = res
+    await update.message.reply_text(fmt_tomorrow(name, tmin, tmax, wind_noon, desc_noon), reply_markup=kb())
 
 
 async def on_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -247,7 +270,7 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Источник: текущая геолокация ✅", reply_markup=kb())
 
 
-# зарегистрируем команды в меню Telegram
+# Зарегистрируем команды в меню Telegram
 async def post_init(app):
     await app.bot.set_my_commands([
         BotCommand("start", "показать клавиатуру"),
@@ -256,8 +279,11 @@ async def post_init(app):
     ])
 
 
-# ============ ЗАПУСК ============
+# ---------- ЗАПУСК ----------
 def main():
+    if not TOKEN or not OW_KEY:
+        raise RuntimeError("Нет TELEGRAM_BOT_TOKEN или OPENWEATHER_API_KEY в переменных окружения")
+
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
