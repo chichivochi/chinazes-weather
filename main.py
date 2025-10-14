@@ -5,8 +5,12 @@ from pathlib import Path
 from datetime import datetime, timedelta, time as dtime
 from typing import Optional, Tuple, Dict, Any, List
 from zoneinfo import ZoneInfo
+from html import unescape
 
 import requests
+import feedparser
+from email.utils import parsedate_to_datetime
+
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -20,7 +24,6 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
-    JobQueue,
     Job,
 )
 
@@ -28,7 +31,7 @@ from telegram.ext import (
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
 
 def translate_to_ru(text: str) -> str:
-    """Перевод текста на русский через DeepL (если ключ задан)."""
+    """Перевод текста на русский через DeepL (если ключ задан). Никогда не падает."""
     if not text:
         return text
     if not DEEPL_API_KEY:
@@ -57,8 +60,9 @@ log = logging.getLogger("assistant-bot")
 # ---------- КЛЮЧИ / НАСТРОЙКИ ----------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OW_KEY = os.getenv("OPENWEATHER_API_KEY")
-NEWS_KEY = os.getenv("NEWSAPI_KEY")
 TM_KEY = os.getenv("TICKETMASTER_API_KEY")
+EVENTBRITE_TOKEN = os.getenv("EVENTBRITE_TOKEN")   # фолбэк событий
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")           # фоллбэк гороскопа
 
 TZ = ZoneInfo("Europe/Prague")
 DEFAULT_SEND_HOUR = 7
@@ -94,7 +98,6 @@ def ensure_defaults(chat_id: int) -> Dict[str, Any]:
     u.setdefault("daily_hour", DEFAULT_SEND_HOUR)
     u.setdefault("horo_enabled", None)      # None -> ещё не спрашивали; True/False
     u.setdefault("horo_sign", None)         # 'leo' и т.п.
-    u.setdefault("translate_news", True)    # флаг на будущее
     set_user(chat_id, u)
     return u
 
@@ -113,7 +116,7 @@ def settings_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["⏰ Время рассылки", "🌆 Изменить город"],
-            ["♈ Знак зодиака", "📰 Новости в рассылке"],
+            ["♈ Знак зодиака"],
             ["🔙 Назад"],
         ],
         resize_keyboard=True,
@@ -328,77 +331,150 @@ def fmt_tomorrow(name: str, tmin: float, tmax: float, wind_noon: float, desc_noo
         f"👕 Совет:\n{advice}"
     )
 
-# ---------- НОВОСТИ ----------
-def last_hours_iso(hours: int = 5) -> tuple[str, str]:
-    now = datetime.utcnow()
-    to_iso = now.replace(microsecond=0).isoformat() + "Z"
-    frm = now - timedelta(hours=hours)
-    from_iso = frm.replace(microsecond=0).isoformat() + "Z"
-    return from_iso, to_iso
+# ---------- НОВОСТИ (RSS: мир + крипто, бесплатно) ----------
+WORLD_RSS = [
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://feeds.reuters.com/reuters/worldNews",
+    "https://apnews.com/rss",
+]
+CRYPTO_RSS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://www.cointelegraph.com/rss",
+]
 
-def fetch_news_last_hours(hours: int = 5, max_items: int = 3):
-    if not NEWS_KEY:
-        return {"ok": False, "err": "NO_KEY", "items": []}
-    frm, to = last_hours_iso(hours)
-    url = "https://newsapi.org/v2/everything"
-    params = {
-        "apiKey": NEWS_KEY,
-        "sources": "bbc-news,reuters,associated-press",
-        "from": frm,
-        "to": to,
-        "pageSize": max_items,
-        "sortBy": "publishedAt",
-        "language": "en",
-    }
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
-        if data.get("status") != "ok":
-            return {"ok": False, "err": data.get("message", "API_ERROR"), "items": []}
-        items = data.get("articles", [])[:max_items]
-        return {"ok": True, "items": items}
-    except Exception as e:
-        log.exception("fetch_news_last_hours error: %s", e)
-        return {"ok": False, "err": "EXC", "items": []}
+def parse_rss(url: str) -> List[dict]:
+    feed = feedparser.parse(url)
+    items = []
+    for e in feed.entries:
+        # Title
+        title = unescape(getattr(e, "title", "") or "")
+        # Description/summary
+        summ = unescape(getattr(e, "summary", "") or "")
+        # Link
+        link = getattr(e, "link", "") or ""
+        # Published
+        pub = getattr(e, "published", None) or getattr(e, "updated", None)
+        try:
+            published_dt = parsedate_to_datetime(pub) if pub else None
+        except Exception:
+            published_dt = None
+        items.append({
+            "title": title.strip(),
+            "summary": summ.strip(),
+            "link": link.strip(),
+            "published": published_dt,
+        })
+    return items
 
-def fmt_news(items: list) -> str:
+def filter_last_hours(items: List[dict], hours: int) -> List[dict]:
     if not items:
-        return "🗞 За последние часы важных новостей не нашлось."
-    lines = ["🗞 Главные мировые новости (последние 5 часов):", ""]
-    for a in items:
-        title = translate_to_ru(a.get("title", "").strip())
-        desc  = translate_to_ru((a.get("description") or "").strip())
-        url = a.get("url", "")
-        src = (a.get("source") or {}).get("name", "")
-        line = f"• {title} — {src}"
-        if desc:
-            line += f"\n  {desc}"
-        if url:
-            line += f"\n  {url}"
-        lines.append(line)
+        return []
+    now_utc = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
+    cutoff = now_utc - timedelta(hours=hours)
+    fresh = []
+    for it in items:
+        dt = it.get("published")
+        if dt is None:
+            # если нет времени — оставим, но в конец списка
+            it["_score"] = 0
+            fresh.append(it)
+        else:
+            # приводим к UTC
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+            if dt >= cutoff:
+                it["_score"] = 1
+                fresh.append(it)
+    # Сортируем: сначала с датой (свежее сверху), затем без даты
+    fresh.sort(key=lambda x: (x.get("_score", 0), x.get("published") or datetime.min), reverse=True)
+    return fresh
+
+def fetch_news_rss(hours: int = 5, max_world: int = 3, max_crypto: int = 3) -> Dict[str, List[dict]]:
+    world_items: List[dict] = []
+    crypto_items: List[dict] = []
+    try:
+        for u in WORLD_RSS:
+            world_items.extend(parse_rss(u))
+        for u in CRYPTO_RSS:
+            crypto_items.extend(parse_rss(u))
+    except Exception as e:
+        log.exception("RSS parse error: %s", e)
+    world_fresh = filter_last_hours(world_items, hours)[:max_world]
+    crypto_fresh = filter_last_hours(crypto_items, hours)[:max_crypto]
+    return {"world": world_fresh, "crypto": crypto_fresh}
+
+def fmt_news_rss(world: List[dict], crypto: List[dict]) -> str:
+    lines = []
+    if world:
+        lines.append("🗞 Главные мировые новости (последние 5 часов):")
+        lines.append("")
+        for it in world:
+            ttl = translate_to_ru(it.get("title", ""))
+            summ = translate_to_ru(it.get("summary", ""))
+            link = it.get("link", "")
+            piece = f"• {ttl}"
+            if summ:
+                piece += f"\n  {summ}"
+            if link:
+                piece += f"\n  {link}"
+            lines.append(piece)
+        lines.append("")
+    else:
+        lines.append("🗞 За последние 5 часов мировых новостей не нашлось.")
+        lines.append("")
+
+    if crypto:
+        lines.append("₿ Крипто-новости (последние 5 часов):")
+        lines.append("")
+        for it in crypto:
+            ttl = translate_to_ru(it.get("title", ""))
+            summ = translate_to_ru(it.get("summary", ""))
+            link = it.get("link", "")
+            piece = f"• {ttl}"
+            if summ:
+                piece += f"\n  {summ}"
+            if link:
+                piece += f"\n  {link}"
+            lines.append(piece)
+    else:
+        lines.append("₿ За последние 5 часов крипто-новостей не нашлось.")
     return "\n".join(lines)
 
-# ---------- ГОРOСКОП ----------
+# ---------- ГОРOСКОП (Aztro vercel -> RapidAPI fallback) ----------
 def fetch_horoscope(sign_en: str) -> str:
-    """
-    Получает гороскоп на сегодня (используется зеркало Aztro API через Vercel).
-    """
-    url = f"https://aztro-api.vercel.app/api?sign={sign_en}&day=today"
+    # 1) Vercel Aztro mirror (без ключа)
     try:
-        resp = requests.post(url, timeout=10)
-        data = resp.json()
-        desc_en = (data.get("description") or "").strip()
-        desc_ru = ru(desc_en)
-        if desc_ru == desc_en and desc_ru:
-            suffix = " (ориг.)"
-        else:
-            suffix = ""
-        return f"{desc_ru}{suffix}" if desc_ru else "Гороскоп недоступен."
+        url = f"https://aztro-api.vercel.app/api?sign={sign_en}&day=today"
+        r = requests.post(url, timeout=10)
+        if r.ok:
+            data = r.json()
+            desc = (data.get("description") or "").strip()
+            if desc:
+                return translate_to_ru(desc) or "Гороскоп недоступен."
     except Exception as e:
-        log.error("fetch_horoscope error: %s", e)
-        return "Не удалось получить гороскоп на сегодня."
-        
-# ---------- ИВЕНТЫ (Ticketmaster) ----------
+        log.warning("Aztro(vercel) error: %s", e)
+
+    # 2) Fallback: RapidAPI (бесплатный ключ)
+    if RAPIDAPI_KEY:
+        try:
+            url = "https://horoscope-astrology.p.rapidapi.com/horoscope"
+            params = {"sign": sign_en, "day": "today"}
+            headers = {
+                "X-RapidAPI-Key": RAPIDAPI_KEY,
+                "X-RapidAPI-Host": "horoscope-astrology.p.rapidapi.com",
+            }
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+            if r.ok:
+                j = r.json()
+                desc = (j.get("horoscope") or j.get("prediction") or j.get("message") or "").strip()
+                if desc:
+                    return translate_to_ru(desc) or "Гороскоп недоступен."
+        except Exception as e:
+            log.warning("RapidAPI horoscope error: %s", e)
+
+    return "Не удалось получить гороскоп на сегодня."
+
+# ---------- ИВЕНТЫ (Ticketmaster + Eventbrite fallback, сегодня) ----------
 def today_utc_range(tz: ZoneInfo):
     now_local = datetime.now(tz)
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -455,7 +531,52 @@ def events_today_by_coords(lat: float, lon: float, radius_km: int = 50, size: in
         log.exception("events_today_by_coords error: %s", e)
         return {"ok": False, "err": "EXC", "items": []}
 
-def pick_event_text(ev: dict) -> str:
+# ---------- EVENTBRITE (фолбэк, если Ticketmaster пусто) ----------
+def events_today_eventbrite_by_city(city: str, size: int = 10):
+    if not EVENTBRITE_TOKEN:
+        return {"ok": False, "err": "NO_KEY", "items": []}
+    start, end = today_utc_range(TZ)
+    url = "https://www.eventbriteapi.com/v3/events/search/"
+    params = {
+        "location.address": city,
+        "start_date.range_start": start,
+        "start_date.range_end": end,
+        "expand": "venue",
+        "sort_by": "date",
+        "page_size": size,
+    }
+    try:
+        r = requests.get(url, params=params, headers={"Authorization": f"Bearer {EVENTBRITE_TOKEN}"}, timeout=15)
+        data = r.json()
+        return {"ok": True, "items": data.get("events", [])}
+    except Exception as e:
+        log.exception("events_today_eventbrite_by_city error: %s", e)
+        return {"ok": False, "err": "EXC", "items": []}
+
+def events_today_eventbrite_by_coords(lat: float, lon: float, radius_km: int = 50, size: int = 10):
+    if not EVENTBRITE_TOKEN:
+        return {"ok": False, "err": "NO_KEY", "items": []}
+    start, end = today_utc_range(TZ)
+    url = "https://www.eventbriteapi.com/v3/events/search/"
+    params = {
+        "location.latitude": lat,
+        "location.longitude": lon,
+        "location.within": f"{radius_km}km",
+        "start_date.range_start": start,
+        "start_date.range_end": end,
+        "expand": "venue",
+        "sort_by": "date",
+        "page_size": size,
+    }
+    try:
+        r = requests.get(url, params=params, headers={"Authorization": f"Bearer {EVENTBRITE_TOKEN}"}, timeout=15)
+        data = r.json()
+        return {"ok": True, "items": data.get("events", [])}
+    except Exception as e:
+        log.exception("events_today_eventbrite_by_coords error: %s", e)
+        return {"ok": False, "err": "EXC", "items": []}
+
+def pick_event_text_tm(ev: dict) -> str:
     txt = (ev.get("info") or "").strip()
     if not txt:
         txt = (ev.get("pleaseNote") or "").strip()
@@ -467,15 +588,23 @@ def pick_event_text(ev: dict) -> str:
                 txt = (cand or "").strip()
         except Exception:
             pass
-    if not txt:
-        return ""
-    return translate_to_ru(txt)
+    return txt
 
-def fmt_events_today(city_name: str, events: list) -> str:
-    if not events:
-        return f"🎭 Сегодня в {city_name} событий не нашлось."
-    lines = [f"🎭 События сегодня в {city_name}:"]
-    for ev in events[:10]:
+def pick_event_text_eb(ev: dict) -> str:
+    # Eventbrite: description.text может быть очень длинным — урежем и переведём
+    desc = ((ev.get("description") or {}).get("text") or "").strip()
+    return desc
+
+def truncate(s: str, n: int = 280) -> str:
+    s = s.strip()
+    if len(s) <= n:
+        return s
+    return s[: n - 1].rstrip() + "…"
+
+def fmt_events_today(city_name: str, events_tm: list, events_eb: list) -> str:
+    events: List[str] = []
+    # Сначала Ticketmaster
+    for ev in events_tm[:10]:
         name = (ev.get("name") or "Без названия").strip()
         dates = (ev.get("dates") or {}).get("start", {})
         local_date = dates.get("localDate", "")
@@ -488,16 +617,56 @@ def fmt_events_today(city_name: str, events: list) -> str:
         when = local_date
         if local_time:
             when += f" {local_time[:5]}"
-        desc_ru = pick_event_text(ev)
+        desc_raw = pick_event_text_tm(ev)
+        desc_ru = translate_to_ru(desc_raw) if desc_raw else ""
         piece = f"• {name}"
         if venue:
             piece += f" — {venue}"
         if when.strip():
             piece += f" ({when})"
         if desc_ru:
-            piece += f"\n  {desc_ru}"
-        lines.append(piece)
-    return "\n".join(lines)
+            piece += f"\n  {truncate(desc_ru)}"
+        url = (ev.get("url") or "").strip()
+        if url:
+            piece += f"\n  {url}"
+        events.append(piece)
+
+    # Потом Eventbrite (если TM пусто — будут только EB)
+    if not events_tm:
+        for ev in events_eb[:10]:
+            name = (ev.get("name") or {}).get("text") or "Без названия"
+            name = name.strip()
+            when = ""
+            try:
+                # local приводим как есть (Eventbrite отдаёт ISO)
+                start = (ev.get("start") or {}).get("local") or ""
+                if start:
+                    when = start.replace("T", " ")[:16]
+            except Exception:
+                pass
+            venue = ""
+            try:
+                venue = ((ev.get("venue") or {}).get("name") or "").strip()
+            except Exception:
+                pass
+            desc_raw = pick_event_text_eb(ev)
+            desc_ru = translate_to_ru(desc_raw) if desc_raw else ""
+            url = (ev.get("url") or "").strip()
+
+            piece = f"• {name}"
+            if venue:
+                piece += f" — {venue}"
+            if when:
+                piece += f" ({when})"
+            if desc_ru:
+                piece += f"\n  {truncate(desc_ru)}"
+            if url:
+                piece += f"\n  {url}"
+            events.append(piece)
+
+    if not events:
+        return f"🎭 Сегодня в {city_name} событий не нашлось."
+    return "🎭 События сегодня в {}:\n\n{}".format(city_name, "\n".join(events))
 
 # ---------- ПЛАНИРОВЩИК (персональные рассылки) ----------
 user_daily_jobs: Dict[int, Job] = {}
@@ -574,7 +743,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Готово! Пользуйся меню команд:\n"
         "/weather — погода\n"
-        "/news — новости за 5 часов\n"
+        "/news — мировые + крипто новости (последние 5 часов)\n"
         "/horoscope — гороскоп на сегодня\n"
         "/events — события сегодня в городе\n"
         "/settings — настройки",
@@ -599,33 +768,35 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=weather_kb())
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    res = fetch_news_last_hours(hours=5, max_items=3)
-    if not res["ok"]:
-        if res.get("err") == "NO_KEY":
-            await update.message.reply_text("🛈 Новости не активированы (нет NEWSAPI_KEY). Добавь ключ в переменные окружения.")
-        else:
-            await update.message.reply_text("⚠️ Не удалось получить новости. Попробуй позже.")
-        return
-    await update.message.reply_text(fmt_news(res["items"]))
+    data = fetch_news_rss(hours=5, max_world=3, max_crypto=3)
+    txt = fmt_news_rss(data.get("world", []), data.get("crypto", []))
+    await update.message.reply_text(txt)
 
 async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     u = ensure_defaults(chat_id)
-    if not TM_KEY:
-        await update.message.reply_text("🛈 Функция событий не активирована (нет TICKETMASTER_API_KEY).")
-        return
+
+    # Ticketmaster
     if u.get("mode") == "geo" and u.get("coords"):
         lat, lon = u["coords"]
-        res = events_today_by_coords(lat, lon)
+        r_tm = events_today_by_coords(lat, lon)
         city_name = "твоём районе"
+        # Eventbrite fallback
+        r_eb = events_today_eventbrite_by_coords(lat, lon) if (r_tm.get("items") == []) else {"ok": True, "items": []}
     else:
         city = u.get("city", "Praha")
-        res = events_today_by_city(city)
+        r_tm = events_today_by_city(city)
         city_name = city
-    if not res["ok"]:
-        await update.message.reply_text("Не удалось получить афишу. Попробуй позже.")
+        r_eb = events_today_eventbrite_by_city(city) if (r_tm.get("items") == []) else {"ok": True, "items": []}
+
+    if not r_tm["ok"] and not r_eb["ok"]:
+        await update.message.reply_text("🛈 Функция событий не активирована (нет ключей) или временно недоступна.")
         return
-    await update.message.reply_text(fmt_events_today(city_name, res["items"]))
+
+    tm_items = r_tm.get("items") or []
+    eb_items = r_eb.get("items") or []
+    msg = fmt_events_today(city_name, tm_items, eb_items)
+    await update.message.reply_text(msg)
 
 async def cmd_horoscope(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -744,11 +915,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Выбери знак зодиака:", reply_markup=zodiac_kb())
             return
 
-        if text == "📰 Новости в рассылке":
-            # (на будущее — вкл/выкл новости в ежедневной рассылке)
-            await update.message.reply_text("Пока новости приходят только по команде /news.", reply_markup=settings_kb())
-            return
-
         if text == "🔙 Назад":
             context.chat_data.pop("settings_mode", None)
             await update.message.reply_text("Ок. Используй команды меню: /weather /news /horoscope /events /settings", reply_markup=ReplyKeyboardRemove())
@@ -796,10 +962,16 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- РЕГИСТРАЦИЯ КОМАНД, ЗАПУСК ----------
 async def post_init(app):
+    # на всякий случай убираем возможный webhook, чтобы polling не конфликтовал
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
     await app.bot.set_my_commands([
         BotCommand("start", "запуск бота"),
         BotCommand("weather", "погода: сегодня/завтра"),
-        BotCommand("news", "3 главные мировые новости (5 часов)"),
+        BotCommand("news", "мировые + крипто новости (5 часов)"),
         BotCommand("horoscope", "гороскоп на сегодня"),
         BotCommand("events", "события сегодня в городе"),
         BotCommand("settings", "настройки"),
