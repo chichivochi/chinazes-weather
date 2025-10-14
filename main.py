@@ -23,7 +23,26 @@ from telegram.ext import (
     JobQueue,
     Job,
 )
-from googletrans import Translator
+# ---------- ПЕРЕВОД НА РУССКИЙ (DeepL) ----------
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
+
+def translate_to_ru(text: str) -> str:
+    """Перевод текста на русский через DeepL"""
+    if not text:
+        return text
+    try:
+        resp = requests.post(
+            "https://api-free.deepl.com/v2/translate",
+            data={"text": text, "target_lang": "RU"},
+            headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"},
+            timeout=12,
+        )
+        if resp.ok:
+            data = resp.json()
+            return data.get("translations", [{}])[0].get("text", text)
+    except Exception as e:
+        print("Ошибка перевода:", e)
+    return text
 
 # ---------- ЛОГИ ----------
 logging.basicConfig(
