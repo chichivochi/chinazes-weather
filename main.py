@@ -380,20 +380,24 @@ def fmt_news(items: list) -> str:
 
 # ---------- ГОРOСКОП ----------
 def fetch_horoscope(sign_en: str) -> str:
-    url = f"https://aztro.sameerkumar.website/?sign={sign_en}&day=today"
+    """
+    Получает гороскоп на сегодня (используется зеркало Aztro API через Vercel).
+    """
+    url = f"https://aztro-api.vercel.app/api?sign={sign_en}&day=today"
     try:
         resp = requests.post(url, timeout=10)
         data = resp.json()
         desc_en = (data.get("description") or "").strip()
-        desc_ru = translate_to_ru(desc_en)
+        desc_ru = ru(desc_en)
         if desc_ru == desc_en and desc_ru:
             suffix = " (ориг.)"
         else:
             suffix = ""
         return f"{desc_ru}{suffix}" if desc_ru else "Гороскоп недоступен."
-    except Exception:
+    except Exception as e:
+        log.error("fetch_horoscope error: %s", e)
         return "Не удалось получить гороскоп на сегодня."
-
+        
 # ---------- ИВЕНТЫ (Ticketmaster) ----------
 def today_utc_range(tz: ZoneInfo):
     now_local = datetime.now(tz)
