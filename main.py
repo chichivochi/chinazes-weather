@@ -23,13 +23,16 @@ from telegram.ext import (
     JobQueue,
     Job,
 )
+
 # ---------- ПЕРЕВОД НА РУССКИЙ (DeepL) ----------
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
 
 def translate_to_ru(text: str) -> str:
-    """Перевод текста на русский через DeepL"""
+    """Перевод текста на русский через DeepL (если ключ задан)."""
     if not text:
         return text
+    if not DEEPL_API_KEY:
+        return text  # без ключа отдаём оригинал
     try:
         resp = requests.post(
             "https://api-free.deepl.com/v2/translate",
@@ -59,16 +62,6 @@ TM_KEY = os.getenv("TICKETMASTER_API_KEY")
 
 TZ = ZoneInfo("Europe/Prague")
 DEFAULT_SEND_HOUR = 7
-
-# ---------- ПЕРЕВОДЧИК (для новостей/гороскопа/ивентов) ----------
-_tr = Translator()
-def ru(text: str) -> str:
-    if not text:
-        return ""
-    try:
-        return _tr.translate(text, dest="ru").text
-    except Exception:
-        return text  # fallback: отдаём оригинал
 
 # ---------- ПРОСТЕЙШАЯ БД (переживает рестарты) ----------
 DB_PATH = Path("users.db")  # JSON с настройками на чат
@@ -101,7 +94,7 @@ def ensure_defaults(chat_id: int) -> Dict[str, Any]:
     u.setdefault("daily_hour", DEFAULT_SEND_HOUR)
     u.setdefault("horo_enabled", None)      # None -> ещё не спрашивали; True/False
     u.setdefault("horo_sign", None)         # 'leo' и т.п.
-    u.setdefault("translate_news", True)    # переводить новости на русский
+    u.setdefault("translate_news", True)    # флаг на будущее
     set_user(chat_id, u)
     return u
 
@@ -164,13 +157,13 @@ ZODIAC_MAP_RU_EN: Dict[str, str] = {
 
 def normalize_sign(text: str) -> Optional[str]:
     t = (text or "").strip().lower()
-    t = t.replace("♈","").replace("♉","").replace("♊","").replace("♋","").replace("♌","").replace("♍","") \
-         .replace("♎","").replace("♏","").replace("♐","").replace("♑","").replace("♒","").replace("♓","") \
-         .strip()
+    t = (t.replace("♈","").replace("♉","").replace("♊","").replace("♋","").replace("♌","").replace("♍","")
+           .replace("♎","").replace("♏","").replace("♐","").replace("♑","").replace("♒","").replace("♓","")
+           .strip())
     return ZODIAC_MAP_RU_EN.get(t)
 
 # ---------- OPENWEATHER ----------
-def rain_warning_line(desc: str, pop: float | None = None) -> str:
+def rain_warning_line(desc: str, pop: Optional[float] = None) -> str:
     d = (desc or "").lower()
     has_rain = any(k in d for k in ["дожд", "rain", "морос", "гроза", "thunder"])
     if pop is not None:
@@ -274,17 +267,18 @@ def get_clothing_advice(temp_c: float, description: str, wind_speed: float = 0) 
     windy = wind_speed >= 8
     very_windy = wind_speed >= 14
 
-    lines = []
+    lines: List[str] = []
     if temp_c <= 0:
-        lines.append("Очень холодно 🥶. Надень тёплое термобельё, сверху — шерстяной или флисовый свитер, и плотную зимнюю куртку. Обязательно шапка, шарф и тёплые перчатки. Обувь — зимняя с толстой подошвой.")
+        lines.append("Очень холодно 🥶. Надень тёплое термобельё, сверху — шерстяной/флисовый слой и плотную зимнюю куртку. Обязательно шапка, шарф и тёплые перчатки. Обувь — зимняя с толстой подошвой.")
     elif 0 < temp_c <= 5:
         lines.append("Холодно ❄️. Тёплая куртка + свитер/худи. Шапка и перчатки желательны. Обувь — утеплённые ботинки или кроссовки на толстой подошве.")
     elif 5 < temp_c <= 12:
-        lines.append("Прохладно 🌬. Лёгкая куртка/ветровка или худи, можно добавить тонкий свитер слоем. Обувь — закрытая (кроссовки/ботинки).")
+        lines.append("Прохладно 🌬. Лёгкая куртка/ветровка или худи, можно тонкий свитер слоем. Обувь — закрытая (кроссовки/ботинки).")
     elif 12 < temp_c <= 20:
         lines.append("Умеренно 🌤. Футболка/лонгслив, при желании лёгкая накидка или тонкая куртка. Обувь — кроссовки, мокасины.")
     else:
         lines.append("Тепло/жарко ☀️. Лёгкая одежда из хлопка/льна: футболка, шорты/платье. Пей больше воды; по возможности избегай прямого солнца в полдень.")
+
     if is_rain:
         if is_heavy:
             lines.append("🌧 Сильный дождь — возьми зонт или непромокаемый плащ, куртку с капюшоном и водостойкую обувь.")
@@ -334,7 +328,7 @@ def fmt_tomorrow(name: str, tmin: float, tmax: float, wind_noon: float, desc_noo
         f"👕 Совет:\n{advice}"
     )
 
-# ---------- ГЁРЛИНЫЕ НОВОСТИ ----------
+# ---------- НОВОСТИ ----------
 def last_hours_iso(hours: int = 5) -> tuple[str, str]:
     now = datetime.utcnow()
     to_iso = now.replace(microsecond=0).isoformat() + "Z"
@@ -372,8 +366,8 @@ def fmt_news(items: list) -> str:
         return "🗞 За последние часы важных новостей не нашлось."
     lines = ["🗞 Главные мировые новости (последние 5 часов):", ""]
     for a in items:
-        title = ru(a.get("title", "").strip())
-        desc = ru((a.get("description") or "").strip())
+        title = translate_to_ru(a.get("title", "").strip())
+        desc  = translate_to_ru((a.get("description") or "").strip())
         url = a.get("url", "")
         src = (a.get("source") or {}).get("name", "")
         line = f"• {title} — {src}"
@@ -391,7 +385,7 @@ def fetch_horoscope(sign_en: str) -> str:
         resp = requests.post(url, timeout=10)
         data = resp.json()
         desc_en = (data.get("description") or "").strip()
-        desc_ru = ru(desc_en)
+        desc_ru = translate_to_ru(desc_en)
         if desc_ru == desc_en and desc_ru:
             suffix = " (ориг.)"
         else:
@@ -466,12 +460,12 @@ def pick_event_text(ev: dict) -> str:
             promos = ev.get("promoter") or {}
             if isinstance(promos, dict):
                 cand = promos.get("description") or ""
-                txt = cand.strip()
+                txt = (cand or "").strip()
         except Exception:
             pass
     if not txt:
         return ""
-    return ru(txt)
+    return translate_to_ru(txt)
 
 def fmt_events_today(city_name: str, events: list) -> str:
     if not events:
@@ -532,7 +526,7 @@ def schedule_daily_for(app, chat_id: int, hour: int):
     job = app.job_queue.run_daily(send_daily_one, time=t, data={"chat_id": chat_id}, name=f"daily_{chat_id}")
     user_daily_jobs[chat_id] = job
 
-# ---------- ХЭНДЛЕРЫ ПОГОДЫ ----------
+# ---------- ПОГОДНЫЕ ХЭНДЛЕРЫ (сборка текста) ----------
 async def get_today_msg(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
     u = ensure_defaults(chat_id)
     if u.get("mode") == "geo" and u.get("coords"):
@@ -587,7 +581,10 @@ async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ensure_defaults(chat_id)
     context.chat_data["weather_mode"] = True
-    await update.message.reply_text("Выбери: today / tomorrow.\nИ источник ниже: Praha или 📍 геолокация.", reply_markup=weather_kb())
+    await update.message.reply_text(
+        "Выбери: today / tomorrow.\nИ источник ниже: Praha или 📍 геолокация.",
+        reply_markup=weather_kb()
+    )
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await get_today_msg(context, update.effective_chat.id)
@@ -744,7 +741,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if text == "📰 Новости в рассылке":
-            # (задача на будущее — вкл/выкл новости в ежедневной рассылке)
+            # (на будущее — вкл/выкл новости в ежедневной рассылке)
             await update.message.reply_text("Пока новости приходят только по команде /news.", reply_markup=settings_kb())
             return
 
