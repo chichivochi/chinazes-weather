@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]==21.6
 requests==2.32.3
 tzdata==2024.1
 googletrans==4.0.0-rc1
+httpx==0.27.0
