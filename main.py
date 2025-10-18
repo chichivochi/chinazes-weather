@@ -111,10 +111,12 @@ def weather_kb() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
     )
 
-def settings_kb() -> ReplyKeyboardMarkup:
+def settings_kb(u: dict) -> ReplyKeyboardMarkup:
+    horo_label = "Включён" if u.get("horo_enabled") else "Выключен"
     return ReplyKeyboardMarkup(
         [
             ["⏰ Время рассылки", "🌆 Изменить город"],
+            [f"🔮 Гороскоп: {horo_label}"],
             ["♈ Знак зодиака"],
             ["🔙 Назад"],
         ],
@@ -304,7 +306,7 @@ def get_clothing_advice(temp_c: float, description: str, wind_speed: float = 0) 
         lines.append("🧴 Используй SPF по возможности.")
     return "\n".join(lines)
 
-# ---------------- ФОРМАТЫ ПОГОДЫ ----------------
+# ---------------- ФОРМАТЫ ПОГОДы ----------------
 def fmt_now(name: str, temp: float, feels: float, wind: float, desc: str) -> str:
     advice = get_clothing_advice(feels, desc, wind)
     rain_line = rain_warning_line(desc)
@@ -332,10 +334,6 @@ def fmt_tomorrow(name: str, tmin: float, tmax: float, wind_noon: float, desc_noo
 
 # ---------------- ГОРOСКОП (ru.astrologyk.com — ежедневный) ----------------
 def fetch_horoscope(sign_en: str) -> str:
-    """
-    Ежедневный гороскоп с ru.astrologyk.com — только основной прогноз,
-    без хвоста из ссылок/тегов.
-    """
     slug = (sign_en or "").strip().lower()
     if slug not in {
         "aries","taurus","gemini","cancer","leo","virgo",
@@ -353,14 +351,12 @@ def fetch_horoscope(sign_en: str) -> str:
             return "Гороскоп временно недоступен."
 
         soup = BeautifulSoup(resp.text, "lxml")
-        # основной контейнер статьи
         container = (
             soup.find("article")
             or soup.find("div", class_=re.compile("entry-content|post|content"))
             or soup
         )
 
-        # слова-паузы/«мусора» — блоки с множеством ссылок, списки знаков и т.п.
         junk_keywords = [
             "все знаки", "сегодня", "завтра", "неделя", "месяц", "любовь",
             "работа", "здоровье", "китайский", "персональный", "гороскоп 202",
@@ -371,9 +367,7 @@ def fetch_horoscope(sign_en: str) -> str:
         pieces: List[str] = []
         chars = 0
 
-        # берём только «смысловые» абзацы, пропуская блоки с кучей ссылок
         for node in container.find_all(["p", "div"], recursive=True):
-            # если это явные служебные блоки — пропускаем
             classes = " ".join(node.get("class", [])).lower()
             if any(k in classes for k in ("tags", "share", "social", "breadcrumbs", "related", "nav")):
                 continue
@@ -383,14 +377,11 @@ def fetch_horoscope(sign_en: str) -> str:
 
             if not text:
                 continue
-            # отбрасываем слишком короткие/служебные куски
             if len(text) < 50:
                 continue
-            # блок с кучей ссылок (обычно «Сегодня/Завтра/Все знаки…»)
             if links_count >= 3:
                 continue
             tl = text.lower()
-            # если в куске очень много «мусорных» слов или почти все знаки — пропускаем
             if sum(1 for w in junk_keywords if w in tl) >= 2:
                 continue
             if sum(1 for w in zodiac_words if w in tl) >= 4:
@@ -398,14 +389,12 @@ def fetch_horoscope(sign_en: str) -> str:
 
             pieces.append(text)
             chars += len(text)
-            # обычно 1–2 абзаца достаточно; ограничим объём
             if chars > 900 or len(pieces) >= 3:
                 break
 
         clean = " ".join(pieces).strip()
         if not clean:
             clean = "Не удалось извлечь текст гороскопа. Открой ссылку ниже."
-        # финальная подрезка на всякий случай
         if len(clean) > 1400:
             clean = clean[:1398].rstrip() + "…"
 
@@ -415,9 +404,8 @@ def fetch_horoscope(sign_en: str) -> str:
     except Exception as e:
         log.exception("astrologyk daily fetch error: %s", e)
         return "Ошибка при получении гороскопа."
-        
+
 # ---------------- НОВОСТИ: 3 ПОСЛЕДНИХ ПОСТА ИЗ ТГ-КАНАЛА ----------------
-# пробуем несколько зеркал RSS; берём первые доступные записи и сортируем по времени (если есть published)
 _TG_RSS_ENDPOINTS = [
     "https://rsshub.app/telegram/channel/{u}",
     "https://rsshub.io/telegram/channel/{u}",
@@ -425,12 +413,25 @@ _TG_RSS_ENDPOINTS = [
     "https://tg.i-c-a.su/rss/{u}",
 ]
 
+def strip_html(html: str) -> str:
+    """Чистим HTML в простой текст (без parse_mode)."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    # <br> -> перевод строки
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    text = soup.get_text("\n")
+    # нормализуем лишние переносы
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
 def _parse_rss_generic(url: str) -> List[dict]:
     feed = feedparser.parse(url)
     items = []
     for e in feed.entries:
-        title = unescape(getattr(e, "title", "") or "").strip()
-        summ  = unescape(getattr(e, "summary", "") or "").strip()
+        title = strip_html(unescape(getattr(e, "title", "") or "").strip())
+        summ  = strip_html(unescape(getattr(e, "summary", "") or "").strip())
         link  = (getattr(e, "link", "") or "").strip()
         dt = None
         try:
@@ -488,14 +489,24 @@ async def send_daily_one(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     u = ensure_defaults(chat_id)
     try:
+        # 1) Погода
         msg = await get_today_msg(context, chat_id)
         txt = "⏰ Ежедневный прогноз:\n\n" + msg
+
+        # 2) Гороскоп (если включён)
         if u.get("horo_enabled") and u.get("horo_sign"):
             sign = u["horo_sign"]
             htxt = fetch_horoscope(sign)
             sign_ru = [k for k, v in ZODIAC_MAP_RU_EN.items() if v == sign and k.isalpha() and len(k) > 2]
             sign_ru = sign_ru[0].capitalize() if sign_ru else sign.capitalize()
             txt += f"\n\n🔮 Гороскоп ({sign_ru}):\n{htxt}"
+
+        # 3) Новости (3 последних из канала)
+        if NEWS_TG_CHANNEL:
+            items = fetch_tg_channel_latest(n=3)
+            news_block = fmt_tg_news(items)
+            txt += f"\n\n{news_block}"
+
         await context.bot.send_message(chat_id, txt)
     except Exception as e:
         log.error("Ошибка отправки ежедневного сообщения %s: %s", chat_id, e)
@@ -598,7 +609,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"⚙️ Настройки:\n• Время рассылки: {u['daily_hour']:02d}:00\n• Город: {u.get('city','Praha')}\n"
         f"• Гороскоп: {'включён' if u.get('horo_enabled') else 'выключен' if u.get('horo_enabled') is not None else 'не настроен'}",
-        reply_markup=settings_kb(),
+        reply_markup=settings_kb(u),
     )
 
 # ---------------- ОБРАБОТКА ТЕКСТА ----------------
@@ -647,6 +658,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # настройки
     if context.chat_data.get("settings_mode"):
+        # тумблер гороскопа
+        if text.startswith("🔮"):
+            if not u.get("horo_sign"):
+                u["horo_enabled"] = True
+                set_user(chat_id, u)
+                context.chat_data["awaiting_zodiac_pick"] = True
+                await update.message.reply_text("Выбери знак зодиака (для гороскопа):", reply_markup=zodiac_kb())
+                return
+            u["horo_enabled"] = not bool(u.get("horo_enabled"))
+            set_user(chat_id, u)
+            state = "включён ✅" if u["horo_enabled"] else "выключен 🚫"
+            await update.message.reply_text(f"Гороскоп в ежедневной рассылке {state}.", reply_markup=settings_kb(u))
+            return
+
         if text == "⏰ Время рассылки":
             context.chat_data["awaiting_hour"] = True
             await update.message.reply_text("Выбери час (0–23) или «Ввести вручную».", reply_markup=hours_kb())
@@ -654,7 +679,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.chat_data.get("awaiting_hour"):
             if text.lower() == "отмена":
                 context.chat_data.pop("awaiting_hour", None)
-                await update.message.reply_text("Ок, отменил.", reply_markup=settings_kb())
+                await update.message.reply_text("Ок, отменил.", reply_markup=settings_kb(u))
                 return
             if text.lower() == "ввести вручную":
                 await update.message.reply_text("Напиши час числом (0–23).", reply_markup=ReplyKeyboardRemove())
@@ -670,7 +695,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_user(chat_id, u)
             schedule_daily_for(context.application, chat_id, hour)
             context.chat_data.pop("awaiting_hour", None)
-            await update.message.reply_text(f"✅ Ежедневная рассылка в {hour:02d}:00 (Europe/Prague).", reply_markup=settings_kb())
+            await update.message.reply_text(f"✅ Ежедневная рассылка в {hour:02d}:00 (Europe/Prague).", reply_markup=settings_kb(u))
             return
 
         if text == "🌆 Изменить город":
@@ -687,7 +712,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             u["mode"] = "city"
             set_user(chat_id, u)
             context.chat_data.pop("awaiting_city", None)
-            await update.message.reply_text(f"Город установлен: {city}", reply_markup=settings_kb())
+            await update.message.reply_text(f"Город установлен: {city}", reply_markup=settings_kb(u))
             return
 
         if text == "♈ Знак зодиака":
@@ -700,7 +725,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ок. Команды: /weather /news /horoscope /settings", reply_markup=ReplyKeyboardRemove())
             return
 
-        await update.message.reply_text("Выбери пункт меню настроек.", reply_markup=settings_kb())
+        await update.message.reply_text("Выбери пункт меню настроек.", reply_markup=settings_kb(u))
         return
 
     # weather режим
