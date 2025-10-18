@@ -6,10 +6,12 @@ from datetime import datetime, timedelta, time as dtime
 from typing import Optional, Tuple, Dict, Any, List
 from zoneinfo import ZoneInfo
 from html import unescape
+import re
 
 import requests
+import feedparser
 from bs4 import BeautifulSoup
-from email.utils import parsedate_to_datetime  # (на будущее, если добавишь RSS)
+from email.utils import parsedate_to_datetime
 
 from telegram import (
     Update,
@@ -27,15 +29,14 @@ from telegram.ext import (
     Job,
 )
 
-# ---------------- ПЕРЕВОД НА РУССКИЙ (DeepL) ----------------
+# ---------------- ПЕРЕВОД НА РУССКИЙ (DeepL: опционально) ----------------
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
 
 def translate_to_ru(text: str) -> str:
-    """Перевод через DeepL (если ключ задан). Никогда не падает."""
     if not text:
         return text
     if not DEEPL_API_KEY:
-        return text  # без ключа отдаём оригинал
+        return text
     try:
         resp = requests.post(
             "https://api-free.deepl.com/v2/translate",
@@ -60,14 +61,13 @@ log = logging.getLogger("assistant-bot")
 # ---------------- КЛЮЧИ / НАСТРОЙКИ ----------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OW_KEY = os.getenv("OPENWEATHER_API_KEY")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")  # фолбэк для гороскопа
-NEWS_TG_CHANNEL_USERNAME = os.getenv("NEWS_TG_CHANNEL_USERNAME")  # username канала без @
+NEWS_TG_CHANNEL = os.getenv("NEWS_TG_CHANNEL_USERNAME", "").strip().lstrip("@")  # например: tictacnews1
 
 TZ = ZoneInfo("Europe/Prague")
 DEFAULT_SEND_HOUR = 7
 
-# ---------------- ПРОСТЕЙШАЯ БД (JSON) ----------------
-DB_PATH = Path("users.db")  # JSON с настройками на чат
+# ---------------- БД (JSON) ----------------
+DB_PATH = Path("users.db")
 
 def load_db() -> Dict[str, Any]:
     if DB_PATH.exists():
@@ -75,7 +75,7 @@ def load_db() -> Dict[str, Any]:
             return json.loads(DB_PATH.read_text("utf-8"))
         except Exception:
             log.warning("users.db повреждён, создаю новый.")
-    return {"users": {}}  # {chat_id: {...}}
+    return {"users": {}}
 
 def save_db(db: Dict[str, Any]) -> None:
     DB_PATH.write_text(json.dumps(db, ensure_ascii=False, indent=2), "utf-8")
@@ -93,10 +93,10 @@ def ensure_defaults(chat_id: int) -> Dict[str, Any]:
     u = get_user(chat_id)
     u.setdefault("mode", "city")            # city | geo
     u.setdefault("city", "Praha")
-    u.setdefault("coords", None)            # [lat, lon] | None
+    u.setdefault("coords", None)            # [lat, lon]
     u.setdefault("daily_hour", DEFAULT_SEND_HOUR)
-    u.setdefault("horo_enabled", None)      # None -> ещё не спрашивали; True/False
-    u.setdefault("horo_sign", None)         # 'leo' и т.п.
+    u.setdefault("horo_enabled", None)      # None -> спросить; True/False
+    u.setdefault("horo_sign", None)         # 'leo', 'scorpio' ...
     set_user(chat_id, u)
     return u
 
@@ -164,7 +164,7 @@ def normalize_sign(text: str) -> Optional[str]:
            .strip())
     return ZODIAC_MAP_RU_EN.get(t)
 
-# ---------------- OPENWEATHER ----------------
+# ---------------- ПОГОДА (OpenWeather) ----------------
 def rain_warning_line(desc: str, pop: Optional[float] = None) -> str:
     d = (desc or "").lower()
     has_rain = any(k in d for k in ["дожд", "rain", "морос", "гроза", "thunder"])
@@ -271,15 +271,15 @@ def get_clothing_advice(temp_c: float, description: str, wind_speed: float = 0) 
 
     lines: List[str] = []
     if temp_c <= 0:
-        lines.append("Очень холодно 🥶. Термобельё + шерстяной/флисовый слой + зимняя куртка. Шапка, шарф, тёплые перчатки. Обувь — зимняя.")
+        lines.append("Очень холодно 🥶. Термобельё + флис/шерсть + зимняя куртка. Шапка, шарф, тёплые перчатки. Тёплая обувь.")
     elif 0 < temp_c <= 5:
-        lines.append("Холодно ❄️. Тёплая куртка + свитер/худи. Желательны шапка и перчатки. Обувь — утеплённые ботинки/кроссовки.")
+        lines.append("Холодно ❄️. Тёплая куртка + свитер/худи. Желательны шапка и перчатки. Обувь — утеплённая.")
     elif 5 < temp_c <= 12:
-        lines.append("Прохладно 🌬. Лёгкая куртка/ветровка или худи, можно тонкий свитер слоем. Обувь — закрытая.")
+        lines.append("Прохладно 🌬. Лёгкая куртка/ветровка или худи, можно тонкий свитер. Обувь — закрытая.")
     elif 12 < temp_c <= 20:
         lines.append("Умеренно 🌤. Футболка/лонгслив, при желании лёгкая куртка. Обувь — кроссовки, мокасины.")
     else:
-        lines.append("Тепло/жарко ☀️. Лёгкая одежда (хлопок/лён), шорты/платье. Пей воду, избегай палящего солнца в полдень.")
+        lines.append("Тепло/жарко ☀️. Лёгкая одежда (хлопок/лён), шорты/платье. Пей воду, избегай палящего солнца.")
 
     if is_rain:
         if is_heavy:
@@ -304,7 +304,7 @@ def get_clothing_advice(temp_c: float, description: str, wind_speed: float = 0) 
         lines.append("🧴 Используй SPF по возможности.")
     return "\n".join(lines)
 
-# ---------------- ФОРМАТЫ СООБЩЕНИЙ ПОГОДЫ ----------------
+# ---------------- ФОРМАТЫ ПОГОДЫ ----------------
 def fmt_now(name: str, temp: float, feels: float, wind: float, desc: str) -> str:
     advice = get_clothing_advice(feels, desc, wind)
     rain_line = rain_warning_line(desc)
@@ -330,105 +330,112 @@ def fmt_tomorrow(name: str, tmin: float, tmax: float, wind_noon: float, desc_noo
         f"👕 Совет:\n{advice}"
     )
 
-# ---------------- ГОРOСКОП (3 источника: sameerkumar → vercel → RapidAPI) ----------------
+# ---------------- ГОРOСКОП (ru.astrologyk.com — ежедневный) ----------------
 def fetch_horoscope(sign_en: str) -> str:
-    # 1) Ohmanda (без ключа)
-    try:
-        r = requests.get(f"https://ohmanda.com/api/horoscope/{sign_en}", timeout=10)
-        if r.ok:
-            j = r.json()
-            desc = (j.get("horoscope") or "").strip()
-            if desc:
-                return translate_to_ru(desc) or "Гороскоп недоступен."
-    except Exception as e:
-        log.warning("Ohmanda horoscope error: %s", e)
+    """
+    Ежедневный гороскоп с ru.astrologyk.com.
+    sign_en: aries, taurus, ..., pisces
+    """
+    slug = (sign_en or "").strip().lower()
+    if slug not in {
+        "aries","taurus","gemini","cancer","leo","virgo","libra","scorpio","sagittarius","capricorn","aquarius","pisces"
+    }:
+        return "Не распознал знак зодиака."
 
-    # 2) Vercel Aztro mirror (без ключа)
+    url = f"https://ru.astrologyk.com/horoscope/daily/{slug}"
     try:
-        r = requests.post(f"https://aztro-api.vercel.app/api?sign={sign_en}&day=today", timeout=10)
-        if r.ok:
-            data = r.json()
-            desc = (data.get("description") or "").strip()
-            if desc:
-                return translate_to_ru(desc) or "Гороскоп недоступен."
-    except Exception as e:
-        log.warning("Aztro(vercel) error: %s", e)
+        resp = requests.get(
+            url, timeout=12,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"}
+        )
+        if not resp.ok:
+            return "Гороскоп временно недоступен."
 
-    # 3) RapidAPI (опционально)
-    if RAPIDAPI_KEY:
+        soup = BeautifulSoup(resp.text, "lxml")
+        container = soup.find("article") or soup.find("div", class_=re.compile("entry-content|content")) or soup
+
+        paras = []
+        for p in container.find_all(["p", "div"], recursive=True):
+            txt = p.get_text(" ", strip=True)
+            if not txt or len(txt) < 50:
+                continue
+            paras.append(txt)
+            if len(" ".join(paras)) > 1200 or len(paras) >= 3:
+                break
+
+        text = " ".join(paras).strip()
+        if not text:
+            text = "Не удалось извлечь текст гороскопа. Открой ссылку ниже."
+        if len(text) > 1500:
+            text = text[:1499].rstrip() + "…"
+        text += f"\n\nИсточник: {url}"
+        return text
+    except Exception as e:
+        log.exception("astrologyk daily fetch error: %s", e)
+        return "Ошибка при получении гороскопа."
+
+# ---------------- НОВОСТИ: 3 ПОСЛЕДНИХ ПОСТА ИЗ ТГ-КАНАЛА ----------------
+# пробуем несколько зеркал RSS; берём первые доступные записи и сортируем по времени (если есть published)
+_TG_RSS_ENDPOINTS = [
+    "https://rsshub.app/telegram/channel/{u}",
+    "https://rsshub.io/telegram/channel/{u}",
+    "https://rsshub.rssforever.com/telegram/channel/{u}",
+    "https://tg.i-c-a.su/rss/{u}",
+]
+
+def _parse_rss_generic(url: str) -> List[dict]:
+    feed = feedparser.parse(url)
+    items = []
+    for e in feed.entries:
+        title = unescape(getattr(e, "title", "") or "").strip()
+        summ  = unescape(getattr(e, "summary", "") or "").strip()
+        link  = (getattr(e, "link", "") or "").strip()
+        dt = None
         try:
-            url = "https://horoscope-astrology.p.rapidapi.com/horoscope"
-            params = {"sign": sign_en, "day": "today"}
-            headers = {
-                "X-RapidAPI-Key": RAPIDAPI_KEY,
-                "X-RapidAPI-Host": "horoscope-astrology.p.rapidapi.com",
-            }
-            r = requests.get(url, params=params, headers=headers, timeout=10)
-            if r.ok:
-                j = r.json()
-                desc = (j.get("horoscope") or j.get("prediction") or j.get("message") or "").strip()
-                if desc:
-                    return translate_to_ru(desc) or "Гороскоп недоступен."
+            raw = getattr(e, "published", None) or getattr(e, "updated", None)
+            dt = parsedate_to_datetime(raw) if raw else None
+            if dt and dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        except Exception:
+            dt = None
+        items.append({"title": title, "summary": summ, "link": link, "published": dt})
+    return items
+
+def fetch_tg_channel_latest(n: int = 3) -> List[dict]:
+    u = NEWS_TG_CHANNEL
+    if not u:
+        return []
+    for tpl in _TG_RSS_ENDPOINTS:
+        url = tpl.format(u=u)
+        try:
+            items = _parse_rss_generic(url)
+            if items:
+                with_ts = [it for it in items if it.get("published")]
+                if with_ts:
+                    with_ts.sort(key=lambda x: x["published"], reverse=True)
+                    items = with_ts + [it for it in items if not it.get("published")]
+                return items[:n]
         except Exception as e:
-            log.warning("RapidAPI horoscope error: %s", e)
+            log.warning("TG RSS fetch failed for %s: %s", url, e)
+            continue
+    return []
 
-    return "Не удалось получить гороскоп на сегодня."
-    
-# ---------------- НОВОСТИ ИЗ ПУБЛИЧНОГО ТЕЛЕГРАМ-КАНАЛА ----------------
-def fetch_public_channel_posts(username: str, timeout: int = 12) -> List[dict]:
-    """
-    Тянем https://t.me/s/<username> и достаём последние посты.
-    Возвращаем список словарей: {"text": str, "links": [..]}
-    """
-    if not username:
-        return []
-    url = f"https://t.me/s/{username}"
-    try:
-        html = requests.get(
-            url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}
-        ).text
-    except Exception as e:
-        log.warning("fetch_public_channel_posts error: %s", e)
-        return []
-
-    soup = BeautifulSoup(html, "lxml")
-    posts = []
-    # Каждый пост — div.tgme_widget_message (в порядке от новых к старым)
-    for msg in soup.select("div.tgme_widget_message"):
-        text_el = msg.select_one(".tgme_widget_message_text")
-        if not text_el:
-            text_el = msg.select_one(".tgme_widget_message_description")
-        text = text_el.get_text("\n", strip=True) if text_el else ""
-
-        links = []
-        for a in msg.select(
-            ".tgme_widget_message_text a, .tgme_widget_message_description a"
-        ):
-            href = (a.get("href") or "").strip()
-            if href:
-                links.append(href)
-
-        posts.append({"text": text, "links": links})
-
-    return posts
-
-def pick_channel_news(username: str, max_items: int = 3) -> List[dict]:
-    """Берём просто верхние max_items постов канала как последние/самые свежие."""
-    items = fetch_public_channel_posts(username)
-    return items[:max_items]
-
-def fmt_channel_news(items: List[dict]) -> str:
+def fmt_tg_news(items: List[dict]) -> str:
     if not items:
-        return "За последние часы новостей не нашлось."
-    lines = ["🗞 Последние 3 новости из канала:", ""]
+        ch = NEWS_TG_CHANNEL or "канала"
+        return f"🗞 Не удалось получить новости из @{ch}."
+    lines = ["🗞 Последние 3 новости из Telegram-канала:", ""]
     for it in items:
-        text = translate_to_ru((it.get("text") or "").strip())
-        if len(text) > 700:
-            text = text[:697].rstrip() + "…"
+        ttl  = translate_to_ru(it.get("title", "")) or ""
+        summ = translate_to_ru(it.get("summary", "")) or ""
+        link = it.get("link", "")
+        text = ttl if len(ttl) > len(summ) else summ
+        text = text.strip() or ttl or summ or "Без текста"
+        if len(text) > 400:
+            text = text[:397].rstrip() + "…"
         piece = f"• {text}"
-        links = it.get("links") or []
-        for ln in links[:2]:
-            piece += f"\n  {ln}"
+        if link:
+            piece += f"\n  {link}"
         lines.append(piece)
     return "\n".join(lines)
 
@@ -439,19 +446,14 @@ async def send_daily_one(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     u = ensure_defaults(chat_id)
     try:
-        # Погода today
         msg = await get_today_msg(context, chat_id)
         txt = "⏰ Ежедневный прогноз:\n\n" + msg
-
-        # Гороскоп, если включён
         if u.get("horo_enabled") and u.get("horo_sign"):
             sign = u["horo_sign"]
             htxt = fetch_horoscope(sign)
-            # Русское имя знака из карты
             sign_ru = [k for k, v in ZODIAC_MAP_RU_EN.items() if v == sign and k.isalpha() and len(k) > 2]
             sign_ru = sign_ru[0].capitalize() if sign_ru else sign.capitalize()
             txt += f"\n\n🔮 Гороскоп ({sign_ru}):\n{htxt}"
-
         await context.bot.send_message(chat_id, txt)
     except Exception as e:
         log.error("Ошибка отправки ежедневного сообщения %s: %s", chat_id, e)
@@ -493,11 +495,8 @@ async def get_tomorrow_msg(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     u = ensure_defaults(chat_id)
-
-    # Планируем персональную рассылку (если не спланирована ранее)
     schedule_daily_for(context.application, chat_id, u["daily_hour"])
 
-    # Если гороскоп ещё не настроен — спросим
     if u.get("horo_enabled") is None:
         context.chat_data["awaiting_horo_yesno"] = True
         await update.message.reply_text(
@@ -515,8 +514,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    ensure_defaults(chat_id)
+    ensure_defaults(update.effective_chat.id)
     context.chat_data["weather_mode"] = True
     await update.message.reply_text(
         "Выбери: today / tomorrow.\nИ источник ниже: Praha или 📍 геолокация.",
@@ -532,16 +530,11 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=weather_kb())
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not NEWS_TG_CHANNEL_USERNAME:
-        await update.message.reply_text(
-            "Источник канала не настроен. Укажи NEWS_TG_CHANNEL_USERNAME в переменных окружения."
-        )
+    if not NEWS_TG_CHANNEL:
+        await update.message.reply_text("Источник канала не настроен. Укажи NEWS_TG_CHANNEL_USERNAME без @.")
         return
-    items = pick_channel_news(NEWS_TG_CHANNEL_USERNAME, max_items=3)
-    if not items:
-        await update.message.reply_text("Не удалось прочитать публичное зеркало канала или нет свежих постов.")
-        return
-    await update.message.reply_text(fmt_channel_news(items))
+    items = fetch_tg_channel_latest(n=3)
+    await update.message.reply_text(fmt_tg_news(items))
 
 async def cmd_horoscope(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -566,13 +559,13 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=settings_kb(),
     )
 
-# ---------------- ОБРАБОТКА ТЕКСТА / КНОПОК ----------------
+# ---------------- ОБРАБОТКА ТЕКСТА ----------------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
     u = ensure_defaults(chat_id)
 
-    # --- настройка гороскопа (Да/Нет при старте) ---
+    # настройка гороскопа (Да/Нет)
     if context.chat_data.get("awaiting_horo_yesno"):
         if text.lower() == "да":
             u["horo_enabled"] = True
@@ -591,7 +584,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ответь «Да» или «Нет».", reply_markup=yesno_kb())
             return
 
-    # --- выбор знака зодиака ---
+    # выбор знака
     if context.chat_data.get("awaiting_zodiac_pick"):
         if text.lower() == "отмена":
             context.chat_data.pop("awaiting_zodiac_pick", None)
@@ -610,7 +603,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Готово! Сохранил знак: {sign_ru}.", reply_markup=ReplyKeyboardRemove())
         return
 
-    # --- меню настроек ---
+    # настройки
     if context.chat_data.get("settings_mode"):
         if text == "⏰ Время рассылки":
             context.chat_data["awaiting_hour"] = True
@@ -668,21 +661,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Выбери пункт меню настроек.", reply_markup=settings_kb())
         return
 
-    # --- режим /weather ---
+    # weather режим
     if context.chat_data.get("weather_mode"):
         tl = text.lower()
         if tl == "today":
-            await cmd_today(update, context)
-            return
+            await cmd_today(update, context); return
         if tl == "tomorrow":
-            await cmd_tomorrow(update, context)
-            return
+            await cmd_tomorrow(update, context); return
         if tl == "praha":
-            u["mode"] = "city"
-            u["city"] = "Praha"
-            set_user(chat_id, u)
-            await update.message.reply_text("Источник: Praha ✅", reply_markup=weather_kb())
-            return
+            u["mode"] = "city"; u["city"] = "Praha"; set_user(chat_id, u)
+            await update.message.reply_text("Источник: Praha ✅", reply_markup=weather_kb()); return
         if tl == "🔙 назад".lower():
             context.chat_data.pop("weather_mode", None)
             await update.message.reply_text("Ок. Команды: /weather /news /horoscope /settings", reply_markup=ReplyKeyboardRemove())
@@ -690,7 +678,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нажми today / tomorrow или выбери источник ниже.", reply_markup=weather_kb())
         return
 
-    # если ничего не подошло:
     await update.message.reply_text("Команды: /weather /news /horoscope /settings")
 
 # ---------------- ЛОКАЦИЯ ----------------
@@ -705,14 +692,12 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_user(chat_id, u)
     await update.message.reply_text("Источник: текущая геолокация ✅", reply_markup=weather_kb())
 
-# ---------------- РЕГИСТРАЦИЯ КОМАНД, ЗАПУСК ----------------
+# ---------------- РЕГИСТРАЦИЯ И ЗАПУСК ----------------
 async def post_init(app):
-    # убираем webhook (если вдруг был), чтобы polling не конфликтовал
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-
     await app.bot.set_my_commands([
         BotCommand("start", "запуск бота"),
         BotCommand("weather", "погода: сегодня/завтра"),
@@ -729,8 +714,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("weather", cmd_weather))
-    app.add_handler(CommandHandler("today", cmd_today))       # на всякий случай
-    app.add_handler(CommandHandler("tomorrow", cmd_tomorrow)) # на всякий случай
+    app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("tomorrow", cmd_tomorrow))
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CommandHandler("horoscope", cmd_horoscope))
     app.add_handler(CommandHandler("settings", cmd_settings))
@@ -738,7 +723,7 @@ def main():
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # Перезапускаем персональные джобы для всех из базы
+    # восстановим персональные задачи
     for cid in [int(cid) for cid in load_db()["users"].keys()]:
         u = ensure_defaults(cid)
         schedule_daily_for(app, cid, u["daily_hour"])
