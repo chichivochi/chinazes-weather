@@ -333,12 +333,13 @@ def fmt_tomorrow(name: str, tmin: float, tmax: float, wind_noon: float, desc_noo
 # ---------------- ГОРOСКОП (ru.astrologyk.com — ежедневный) ----------------
 def fetch_horoscope(sign_en: str) -> str:
     """
-    Ежедневный гороскоп с ru.astrologyk.com.
-    sign_en: aries, taurus, ..., pisces
+    Ежедневный гороскоп с ru.astrologyk.com — только основной прогноз,
+    без хвоста из ссылок/тегов.
     """
     slug = (sign_en or "").strip().lower()
     if slug not in {
-        "aries","taurus","gemini","cancer","leo","virgo","libra","scorpio","sagittarius","capricorn","aquarius","pisces"
+        "aries","taurus","gemini","cancer","leo","virgo",
+        "libra","scorpio","sagittarius","capricorn","aquarius","pisces"
     }:
         return "Не распознал знак зодиака."
 
@@ -352,28 +353,69 @@ def fetch_horoscope(sign_en: str) -> str:
             return "Гороскоп временно недоступен."
 
         soup = BeautifulSoup(resp.text, "lxml")
-        container = soup.find("article") or soup.find("div", class_=re.compile("entry-content|content")) or soup
+        # основной контейнер статьи
+        container = (
+            soup.find("article")
+            or soup.find("div", class_=re.compile("entry-content|post|content"))
+            or soup
+        )
 
-        paras = []
-        for p in container.find_all(["p", "div"], recursive=True):
-            txt = p.get_text(" ", strip=True)
-            if not txt or len(txt) < 50:
+        # слова-паузы/«мусора» — блоки с множеством ссылок, списки знаков и т.п.
+        junk_keywords = [
+            "все знаки", "сегодня", "завтра", "неделя", "месяц", "любовь",
+            "работа", "здоровье", "китайский", "персональный", "гороскоп 202",
+        ]
+        zodiac_words = ["овен","телец","близнецы","рак","лев","дева","весы",
+                        "скорпион","стрелец","козерог","водолей","рыбы"]
+
+        pieces: List[str] = []
+        chars = 0
+
+        # берём только «смысловые» абзацы, пропуская блоки с кучей ссылок
+        for node in container.find_all(["p", "div"], recursive=True):
+            # если это явные служебные блоки — пропускаем
+            classes = " ".join(node.get("class", [])).lower()
+            if any(k in classes for k in ("tags", "share", "social", "breadcrumbs", "related", "nav")):
                 continue
-            paras.append(txt)
-            if len(" ".join(paras)) > 1200 or len(paras) >= 3:
+
+            links_count = len(node.find_all("a"))
+            text = node.get_text(" ", strip=True)
+
+            if not text:
+                continue
+            # отбрасываем слишком короткие/служебные куски
+            if len(text) < 50:
+                continue
+            # блок с кучей ссылок (обычно «Сегодня/Завтра/Все знаки…»)
+            if links_count >= 3:
+                continue
+            tl = text.lower()
+            # если в куске очень много «мусорных» слов или почти все знаки — пропускаем
+            if sum(1 for w in junk_keywords if w in tl) >= 2:
+                continue
+            if sum(1 for w in zodiac_words if w in tl) >= 4:
+                continue
+
+            pieces.append(text)
+            chars += len(text)
+            # обычно 1–2 абзаца достаточно; ограничим объём
+            if chars > 900 or len(pieces) >= 3:
                 break
 
-        text = " ".join(paras).strip()
-        if not text:
-            text = "Не удалось извлечь текст гороскопа. Открой ссылку ниже."
-        if len(text) > 1500:
-            text = text[:1499].rstrip() + "…"
-        text += f"\n\nИсточник: {url}"
-        return text
+        clean = " ".join(pieces).strip()
+        if not clean:
+            clean = "Не удалось извлечь текст гороскопа. Открой ссылку ниже."
+        # финальная подрезка на всякий случай
+        if len(clean) > 1400:
+            clean = clean[:1398].rstrip() + "…"
+
+        clean += f"\n\nИсточник: {url}"
+        return clean
+
     except Exception as e:
         log.exception("astrologyk daily fetch error: %s", e)
         return "Ошибка при получении гороскопа."
-
+        
 # ---------------- НОВОСТИ: 3 ПОСЛЕДНИХ ПОСТА ИЗ ТГ-КАНАЛА ----------------
 # пробуем несколько зеркал RSS; берём первые доступные записи и сортируем по времени (если есть published)
 _TG_RSS_ENDPOINTS = [
