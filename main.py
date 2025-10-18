@@ -774,6 +774,9 @@ async def post_init(app):
     ])
 
 def main():
+    import telegram
+    log.info("python-telegram-bot version: %s", getattr(telegram, "__version__", "unknown"))
+
     if not TOKEN or not OW_KEY:
         raise RuntimeError("Нет TELEGRAM_BOT_TOKEN или OPENWEATHER_API_KEY")
 
