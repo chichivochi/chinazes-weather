@@ -332,22 +332,20 @@ def fmt_tomorrow(name: str, tmin: float, tmax: float, wind_noon: float, desc_noo
 
 # ---------------- ГОРOСКОП (3 источника: sameerkumar → vercel → RapidAPI) ----------------
 def fetch_horoscope(sign_en: str) -> str:
-    # 1) Оригинальный Aztro (sameerkumar) — POST
+    # 1) Ohmanda (без ключа)
     try:
-        url = f"https://aztro.sameerkumar.website/?sign={sign_en}&day=today"
-        r = requests.post(url, timeout=10)
+        r = requests.get(f"https://ohmanda.com/api/horoscope/{sign_en}", timeout=10)
         if r.ok:
-            data = r.json()
-            desc = (data.get("description") or "").strip()
+            j = r.json()
+            desc = (j.get("horoscope") or "").strip()
             if desc:
                 return translate_to_ru(desc) or "Гороскоп недоступен."
     except Exception as e:
-        log.warning("Aztro(sameerkumar) error: %s", e)
+        log.warning("Ohmanda horoscope error: %s", e)
 
-    # 2) Vercel mirror — POST
+    # 2) Vercel Aztro mirror (без ключа)
     try:
-        url = f"https://aztro-api.vercel.app/api?sign={sign_en}&day=today"
-        r = requests.post(url, timeout=10)
+        r = requests.post(f"https://aztro-api.vercel.app/api?sign={sign_en}&day=today", timeout=10)
         if r.ok:
             data = r.json()
             desc = (data.get("description") or "").strip()
@@ -356,7 +354,7 @@ def fetch_horoscope(sign_en: str) -> str:
     except Exception as e:
         log.warning("Aztro(vercel) error: %s", e)
 
-    # 3) RapidAPI (если задан ключ)
+    # 3) RapidAPI (опционально)
     if RAPIDAPI_KEY:
         try:
             url = "https://horoscope-astrology.p.rapidapi.com/horoscope"
@@ -375,7 +373,7 @@ def fetch_horoscope(sign_en: str) -> str:
             log.warning("RapidAPI horoscope error: %s", e)
 
     return "Не удалось получить гороскоп на сегодня."
-
+    
 # ---------------- НОВОСТИ ИЗ ПУБЛИЧНОГО ТЕЛЕГРАМ-КАНАЛА ----------------
 def fetch_public_channel_posts(username: str, timeout: int = 12) -> List[dict]:
     """
