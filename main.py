@@ -112,7 +112,10 @@ def weather_kb() -> ReplyKeyboardMarkup:
     )
 
 def settings_kb(u: dict) -> ReplyKeyboardMarkup:
-    horo_label = "Включён" if u.get("horo_enabled") else "Выключен"
+    if u.get("horo_enabled") is None:
+        horo_label = "Не настроен"
+    else:
+        horo_label = "Включён" if u.get("horo_enabled") else "Выключен"
     return ReplyKeyboardMarkup(
         [
             ["⏰ Время рассылки", "🌆 Изменить город"],
@@ -306,7 +309,7 @@ def get_clothing_advice(temp_c: float, description: str, wind_speed: float = 0) 
         lines.append("🧴 Используй SPF по возможности.")
     return "\n".join(lines)
 
-# ---------------- ФОРМАТЫ ПОГОДы ----------------
+# ---------------- ФОРМАТЫ ПОГОДЫ ----------------
 def fmt_now(name: str, temp: float, feels: float, wind: float, desc: str) -> str:
     advice = get_clothing_advice(feels, desc, wind)
     rain_line = rain_warning_line(desc)
@@ -418,11 +421,9 @@ def strip_html(html: str) -> str:
     if not html:
         return ""
     soup = BeautifulSoup(html, "html.parser")
-    # <br> -> перевод строки
     for br in soup.find_all("br"):
         br.replace_with("\n")
     text = soup.get_text("\n")
-    # нормализуем лишние переносы
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
@@ -489,11 +490,9 @@ async def send_daily_one(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     u = ensure_defaults(chat_id)
     try:
-        # 1) Погода
         msg = await get_today_msg(context, chat_id)
         txt = "⏰ Ежедневный прогноз:\n\n" + msg
 
-        # 2) Гороскоп (если включён)
         if u.get("horo_enabled") and u.get("horo_sign"):
             sign = u["horo_sign"]
             htxt = fetch_horoscope(sign)
@@ -501,7 +500,6 @@ async def send_daily_one(context: ContextTypes.DEFAULT_TYPE):
             sign_ru = sign_ru[0].capitalize() if sign_ru else sign.capitalize()
             txt += f"\n\n🔮 Гороскоп ({sign_ru}):\n{htxt}"
 
-        # 3) Новости (3 последних из канала)
         if NEWS_TG_CHANNEL:
             items = fetch_tg_channel_latest(n=3)
             news_block = fmt_tg_news(items)
@@ -512,11 +510,16 @@ async def send_daily_one(context: ContextTypes.DEFAULT_TYPE):
         log.error("Ошибка отправки ежедневного сообщения %s: %s", chat_id, e)
 
 def schedule_daily_for(app, chat_id: int, hour: int):
+    # Обёртка: если нет job_queue (не установлены extras), просто логируем
+    jq = getattr(app, "job_queue", None)
+    if jq is None:
+        log.warning("JobQueue не доступна. Установи пакет с extras: pip install 'python-telegram-bot[job-queue]'.")
+        return
     old = user_daily_jobs.get(chat_id)
     if old:
         old.schedule_removal()
     t = dtime(hour=hour, minute=0, tzinfo=TZ)
-    job = app.job_queue.run_daily(send_daily_one, time=t, data={"chat_id": chat_id}, name=f"daily_{chat_id}")
+    job = jq.run_daily(send_daily_one, time=t, data={"chat_id": chat_id}, name=f"daily_{chat_id}")
     user_daily_jobs[chat_id] = job
 
 # ---------------- СБОРКА ТЕКСТА ПОГОДЫ ----------------
@@ -544,10 +547,34 @@ async def get_tomorrow_msg(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> 
     name, tmin, tmax, wind_noon, desc_noon, pop_max = res
     return fmt_tomorrow(name, tmin, tmax, wind_noon, desc_noon, pop_max)
 
+# ---------------- ВСПОМОГАТЕЛЬНОЕ: парсер часа ----------------
+def parse_hour(text: str) -> Optional[int]:
+    """
+    Извлекает час 0–23 из строки: '7', '07', '13:00', '13.00', '13 ч',
+    допускает невидимые юникод-символы и пробелы.
+    """
+    if not text:
+        return None
+    cleaned = re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060\s]+', ' ', text).strip().lower()
+    m = re.search(r'(^|\D)(\d{1,2})(?:\D?\d{2})?(\D|$)', cleaned)
+    if not m:
+        return None
+    try:
+        h = int(m.group(2))
+        if 0 <= h <= 23:
+            return h
+    except Exception:
+        pass
+    return None
+
 # ---------------- КОМАНДЫ ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     u = ensure_defaults(chat_id)
+
+    # сбрасываем, чтобы не пересекались режимы
+    context.chat_data.pop("weather_mode", None)
+
     schedule_daily_for(context.application, chat_id, u["daily_hour"])
 
     if u.get("horo_enabled") is None:
@@ -606,6 +633,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     u = ensure_defaults(chat_id)
     context.chat_data["settings_mode"] = True
+    context.chat_data.pop("weather_mode", None)
     await update.message.reply_text(
         f"⚙️ Настройки:\n• Время рассылки: {u['daily_hour']:02d}:00\n• Город: {u.get('city','Praha')}\n"
         f"• Гороскоп: {'включён' if u.get('horo_enabled') else 'выключен' if u.get('horo_enabled') is not None else 'не настроен'}",
@@ -676,6 +704,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.chat_data["awaiting_hour"] = True
             await update.message.reply_text("Выбери час (0–23) или «Ввести вручную».", reply_markup=hours_kb())
             return
+
         if context.chat_data.get("awaiting_hour"):
             if text.lower() == "отмена":
                 context.chat_data.pop("awaiting_hour", None)
@@ -684,18 +713,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if text.lower() == "ввести вручную":
                 await update.message.reply_text("Напиши час числом (0–23).", reply_markup=ReplyKeyboardRemove())
                 return
-            try:
-                hour = int(text)
-                if not (0 <= hour <= 23):
-                    raise ValueError
-            except ValueError:
+
+            hour = parse_hour(text)
+            if hour is None:
                 await update.message.reply_text("Час должен быть числом от 0 до 23. Попробуй ещё раз.")
                 return
+
             u["daily_hour"] = hour
             set_user(chat_id, u)
             schedule_daily_for(context.application, chat_id, hour)
             context.chat_data.pop("awaiting_hour", None)
-            await update.message.reply_text(f"✅ Ежедневная рассылка в {hour:02d}:00 (Europe/Prague).", reply_markup=settings_kb(u))
+            await update.message.reply_text(
+                f"✅ Ежедневная рассылка в {hour:02d}:00 (Europe/Prague).",
+                reply_markup=settings_kb(u)
+            )
             return
 
         if text == "🌆 Изменить город":
@@ -759,6 +790,10 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_user(chat_id, u)
     await update.message.reply_text("Источник: текущая геолокация ✅", reply_markup=weather_kb())
 
+# ---------------- ОБРАБОТЧИК ОШИБОК ----------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error: %s", context.error)
+
 # ---------------- РЕГИСТРАЦИЯ И ЗАПУСК ----------------
 async def post_init(app):
     try:
@@ -792,6 +827,8 @@ def main():
 
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    app.add_error_handler(on_error)
 
     # восстановим персональные задачи
     for cid in [int(cid) for cid in load_db()["users"].keys()]:
