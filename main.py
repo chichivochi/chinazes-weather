@@ -347,46 +347,63 @@ def fetch_horoscope(sign_en: str) -> str:
     now = datetime.now(TZ)
     today = now.date()
 
-    import random, difflib
+    import difflib
 
-    # ---------- helpers ----------
-    def _cb() -> str:
-        # агрессивный бьющий кэш суффикс
-        return now.strftime("%Y%m%d%H%M") + f"{random.randint(1000,9999)}"
+    # --- URL-ы источников ---
+    RU_DAILY = f"https://ru.astrologyk.com/horoscope/daily/{slug}"
+    RU_YEST  = f"https://ru.astrologyk.com/horoscope/yesterday/{slug}"
+    RU_TOMOR = f"https://ru.astrologyk.com/horoscope/tomorrow/{slug}"
+    EN_DAILY = f"https://astrologyk.com/horoscope/daily/{slug}"
+    EN_TOMOR = f"https://astrologyk.com/horoscope/tomorrow/{slug}"
 
-    def _headers(lang: str = "ru") -> Dict[str, str]:
-        return {
-            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36"),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7" if lang=="ru" else "en-US,en;q=0.9,ru;q=0.6",
-            "Cache-Control": "no-cache, max-age=0",
-            "Pragma": "no-cache",
-            "Referer": "https://www.google.com/",
-        }
-
-    def http_get(url: str, lang: str = "ru", timeout: int = 12) -> Optional[str]:
-        for _ in range(3):
-            try:
-                r = requests.get(f"{url}?_cb={_cb()}", headers=_headers(lang), timeout=timeout, allow_redirects=True)
-                if r.status_code == 200 and "<html" in r.text.lower():
-                    return r.text
-            except Exception:
-                pass
-        return None
-
-    # proxy-reader (обходит упрямый кэш; возвращает ПЛОСКИЙ текст)
+    # --- Ридер: всегда берём через r.jina.ai, чтобы обойти кэш/Cloudflare ---
     def http_readable(url: str, lang: str = "ru", timeout: int = 12) -> Optional[str]:
         try:
-            # r.jina.ai требует http:// в целевом URL для корректного извлечения
             target = url.replace("https://", "http://")
-            r = requests.get(f"https://r.jina.ai/{target}", headers=_headers(lang), timeout=timeout)
+            r = requests.get(f"https://r.jina.ai/{target}",
+                             headers={
+                                 "User-Agent":"Mozilla/5.0",
+                                 "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7" if lang=="ru" else "en-US,en;q=0.9,ru;q=0.6"
+                             },
+                             timeout=timeout)
             if r.ok and len((r.text or "").strip()) > 100:
                 return r.text
         except Exception:
             pass
         return None
 
+    # === ТВОИ ЖЁСТКИЕ ПРАВИЛА — применяем к plain-text ===
+    junk_keywords = [
+        "все знаки", "сегодня", "завтра", "неделя", "месяц", "любовь",
+        "работа", "здоровье", "китайский", "персональный", "гороскоп 202",
+    ]
+    zodiac_words = ["овен","телец","близнецы","рак","лев","дева","весы",
+                    "скорпион","стрелец","козерог","водолей","рыбы"]
+
+    def pick_text_strict_from_readable(text_plain: str) -> str:
+        # Разбиваем на абзацы по пустым строкам и пропускаем через те же условия
+        paras = [p.strip() for p in re.split(r"\n\s*\n", text_plain or "") if p.strip()]
+        pieces, chars = [], 0
+        for p in paras:
+            if len(p) < 50:
+                continue
+            tl = p.lower()
+            if sum(1 for w in junk_keywords if w in tl) >= 2:
+                continue
+            if sum(1 for w in zodiac_words if w in tl) >= 4:
+                continue
+            if tl.count("http") >= 3:
+                continue
+            pieces.append(p)
+            chars += len(p)
+            if chars > 900 or len(pieces) >= 3:
+                break
+        clean = " ".join(pieces).strip() or "Не удалось извлечь текст гороскопа. Открой ссылку ниже."
+        if len(clean) > 1400:
+            clean = clean[:1398].rstrip() + "…"
+        return clean
+
+    # --- дата (для подписи; не блокирующая логика) ---
     RU_MONTHS = {
         "января":1,"февраля":2,"марта":3,"апреля":4,"мая":5,"июня":6,
         "июля":7,"августа":8,"сентября":9,"октября":10,"ноября":11,"декабря":12
@@ -410,103 +427,18 @@ def fetch_horoscope(sign_en: str) -> str:
         except Exception:
             return None
 
-    # === ТВОЙ ЖЁСТКИЙ ПАРСЕР — без изменений по правилам ===
-    junk_keywords = [
-        "все знаки", "сегодня", "завтра", "неделя", "месяц", "любовь",
-        "работа", "здоровье", "китайский", "персональный", "гороскоп 202",
-    ]
-    zodiac_words = ["овен","телец","близнецы","рак","лев","дева","весы",
-                    "скорпион","стрелец","козерог","водолей","рыбы"]
-
-    def pick_text_strict_from_html(html: str) -> str:
-        soup = BeautifulSoup(html, "lxml")
-        container = (
-            soup.find("article")
-            or soup.find("div", class_=re.compile("entry-content|post|content"))
-            or soup
-        )
-        pieces: List[str] = []
-        chars = 0
-        for node in container.find_all(["p", "div"], recursive=True):
-            classes = " ".join(node.get("class", [])).lower()
-            if any(k in classes for k in ("tags", "share", "social", "breadcrumbs", "related", "nav")):
-                continue
-            links_count = len(node.find_all("a"))
-            text = node.get_text(" ", strip=True)
-            if not text:
-                continue
-            if len(text) < 50:
-                continue
-            if links_count >= 3:
-                continue
-            tl = text.lower()
-            if sum(1 for w in junk_keywords if w in tl) >= 2:
-                continue
-            if sum(1 for w in zodiac_words if w in tl) >= 4:
-                continue
-            pieces.append(text)
-            chars += len(text)
-            if chars > 900 or len(pieces) >= 3:
-                break
-        clean = " ".join(pieces).strip()
-        if not clean:
-            clean = "Не удалось извлечь текст гороскопа. Открой ссылку ниже."
-        if len(clean) > 1400:
-            clean = clean[:1398].rstrip() + "…"
-        return clean
-
-    def pick_text_strict_from_readable(text_plain: str) -> str:
-        # r.jina.ai отдаёт plain-text: имитируем твой парсер —
-        # разобьём по пустым строкам и применим те же «жёсткие» фильтры.
-        paras = [p.strip() for p in re.split(r"\n\s*\n", text_plain or "") if p.strip()]
-        pieces, chars = [], 0
-        for p in paras:
-            if len(p) < 50:
-                continue
-            tl = p.lower()
-            if sum(1 for w in junk_keywords if w in tl) >= 2:
-                continue
-            if sum(1 for w in zodiac_words if w in tl) >= 4:
-                continue
-            # ссылки считаем эвристически (кол-во 'http')
-            if tl.count("http") >= 3:
-                continue
-            pieces.append(p)
-            chars += len(p)
-            if chars > 900 or len(pieces) >= 3:
-                break
-        clean = " ".join(pieces).strip() or "Не удалось извлечь текст гороскопа. Открой ссылку ниже."
-        if len(clean) > 1400:
-            clean = clean[:1398].rstrip() + "…"
-        return clean
-
-    def fetch_page(base_url: str, lang: str, use_reader: bool = False) -> Tuple[Optional[str], Optional[datetime]]:
-        if not use_reader:
-            html = http_get(base_url, lang=lang)
-            if html:
-                text = pick_text_strict_from_html(html)
-                date_src = extract_date(BeautifulSoup(html, "lxml").get_text(" ", strip=True), lang)
-                return text, date_src
-        # fallback через ридер (свежий текст, даже когда CDN/403)
-        txt = http_readable(base_url, lang=lang)
-        if txt:
-            # дата для ридера берётся из самого текста
-            date_src = extract_date(txt, lang)
-            text = pick_text_strict_from_readable(txt)
-            return text, date_src
-        return None, None
-
-    def normalize_for_compare(s: str) -> str:
+    # --- сравнение с «вчера», чтобы понять, застыл ли daily ---
+    def _norm(s: str) -> str:
         s = re.sub(r'\s+', ' ', (s or "").lower()).strip()
         s = re.sub(r'[«»"“”„…—–\-—:;,.!?()\[\]]+', '', s)
         return s
 
-    def looks_like_yesterday(daily_text: str, ru_y_url: str) -> bool:
-        y_txt, _ = fetch_page(ru_y_url, "ru")  # ридер сам включится при надобности
+    def looks_like_yesterday(daily_text: str) -> bool:
+        y_txt = http_readable(RU_YEST, lang="ru")
         if not y_txt or not daily_text:
             return False
-        head_d = normalize_for_compare(daily_text)[:500]
-        head_y = normalize_for_compare(y_txt)[:500]
+        head_d = _norm(pick_text_strict_from_readable(daily_text))[:500]
+        head_y = _norm(pick_text_strict_from_readable(y_txt))[:500]
         if not head_d or not head_y:
             return False
         if head_d == head_y:
@@ -517,57 +449,70 @@ def fetch_horoscope(sign_en: str) -> str:
         set_d, set_y = set(head_d.split()), set(head_y.split())
         return bool(set_d) and (len(set_d & set_y) / len(set_d | set_y)) >= 0.80
 
-    # --- URL-ы ---
-    RU_DAILY = f"https://ru.astrologyk.com/horoscope/daily/{slug}"
-    EN_DAILY = f"https://astrologyk.com/horoscope/daily/{slug}"
-    RU_TOMOR = f"https://ru.astrologyk.com/horoscope/tomorrow/{slug}"
-    EN_TOMOR = f"https://astrologyk.com/horoscope/tomorrow/{slug}"
-    RU_YEST  = f"https://ru.astrologyk.com/horoscope/yesterday/{slug}"
-
-    # 1) RU /daily (сначала обычный HTML; если старьё — reader)
-    txt, dt_src = fetch_page(RU_DAILY, "ru")
-    stale = False
-    if txt:
-        if (dt_src and dt_src.date() < today) or (dt_src is None and looks_like_yesterday(txt, RU_YEST)):
-            # попробуем свежак через reader принудительно
-            txt_r, dt_r = fetch_page(RU_DAILY, "ru", use_reader=True)
-            if txt_r:
-                txt, dt_src = txt_r, (dt_r or dt_src)
-        # снова проверим на «вчера»
-        if (dt_src and dt_src.date() < today) or (dt_src is None and looks_like_yesterday(txt, RU_YEST)):
-            stale = True
-
-    # 2) Если пусто или «вчера» — EN /daily (reader при необходимости) и перевод
-    if (not txt) or stale:
-        t2, d2 = fetch_page(EN_DAILY, "en")
-        if t2:
-            txt = translate_to_ru(t2) or t2
-            dt_src = d2 or dt_src
-            stale = (dt_src and dt_src.date() < today) or (dt_src is None and looks_like_yesterday(txt, RU_YEST))
-        else:
-            stale = True  # EN тоже не дал текста → пойдём на tomorrow
-
-    # 3) Если всё ещё «вчера»/пусто — RU /tomorrow (reader при необходимости), иначе EN /tomorrow (+перевод)
-    if (not txt) or stale:
-        t3, d3 = fetch_page(RU_TOMOR, "ru")
-        if not t3:
-            t3, d3 = fetch_page(EN_TOMOR, "en")
-            if t3:
-                t3 = translate_to_ru(t3) or t3
-        if t3:
-            txt, dt_src = t3, (d3 or dt_src)
-
-    if not txt:
+    # 1) Тянем RU /daily ЧЕРЕЗ РИДЕР (всегда)
+    daily_plain = http_readable(RU_DAILY, lang="ru")
+    if not daily_plain:
+        # если совсем беда — пойдём EN /daily через ридер и переведём
+        en_plain = http_readable(EN_DAILY, lang="en")
+        if en_plain:
+            txt = translate_to_ru(pick_text_strict_from_readable(en_plain)) or pick_text_strict_from_readable(en_plain)
+            dt_src = extract_date(en_plain, "en")
+            if not txt:
+                return "Гороскоп временно недоступен."
+            if dt_src:
+                txt += f"\n\nИсточник: {RU_DAILY}\nДата источника: {dt_src.strftime('%d.%m.%Y')}"
+            else:
+                txt += f"\n\nИсточник: {RU_DAILY}"
+            return txt
+        # fallback: попробуем RU tomorrow через ридер
+        tm_plain = http_readable(RU_TOMOR, lang="ru")
+        if tm_plain:
+            txt = pick_text_strict_from_readable(tm_plain)
+            dt_src = extract_date(tm_plain, "ru")
+            if dt_src:
+                txt += f"\n\nИсточник: {RU_DAILY}\nДата источника: {dt_src.strftime('%d.%m.%Y')}"
+            else:
+                txt += f"\n\nИсточник: {RU_DAILY}"
+            return txt
         return "Гороскоп временно недоступен."
 
-    # финал
-    src_line = RU_DAILY  # основной источник
-    if dt_src:
-        txt += f"\n\nИсточник: {src_line}\nДата источника: {dt_src.strftime('%d.%m.%Y')}"
+    # 2) У нас есть RU /daily (reader). Проверяем «вчерашность».
+    txt_daily = pick_text_strict_from_readable(daily_plain)
+    dt_src_daily = extract_date(daily_plain, "ru")
+    stale = (dt_src_daily and dt_src_daily.date() < today) or (dt_src_daily is None and looks_like_yesterday(daily_plain))
+
+    # 3) Если stale — пробуем RU /tomorrow через ридер
+    if stale:
+        tm_plain = http_readable(RU_TOMOR, lang="ru")
+        if tm_plain:
+            txt = pick_text_strict_from_readable(tm_plain)
+            dt_src = extract_date(tm_plain, "ru") or dt_src_daily
+            if dt_src:
+                txt += f"\n\nИсточник: {RU_DAILY}\nДата источника: {dt_src.strftime('%d.%m.%Y')}"
+            else:
+                txt += f"\n\nИсточник: {RU_DAILY}"
+            return txt
+        # Если RU tomorrow не дал свежего текста — EN daily/tomorrow через ридер
+        en_plain = http_readable(EN_DAILY, lang="en") or http_readable(EN_TOMOR, lang="en")
+        if en_plain:
+            core = pick_text_strict_from_readable(en_plain)
+            txt = translate_to_ru(core) or core
+            dt_src = extract_date(en_plain, "en") or dt_src_daily
+            if dt_src:
+                txt += f"\n\nИсточник: {RU_DAILY}\nДата источника: {dt_src.strftime('%d.%m.%Y')}"
+            else:
+                txt += f"\n\nИсточник: {RU_DAILY}"
+            return txt
+        return "Гороскоп временно недоступен."
+
+    # 4) Daily не stale — используем его
+    txt = txt_daily
+    if dt_src_daily:
+        txt += f"\n\nИсточник: {RU_DAILY}\nДата источника: {dt_src_daily.strftime('%d.%m.%Y')}"
     else:
-        txt += f"\n\nИсточник: {src_line}"
-    return txt    
-    
+        txt += f"\n\nИсточник: {RU_DAILY}"
+    return txt
+
 # ---------------- НОВОСТИ: 3 ПОСЛЕДНИХ ПОСТА ИЗ ТГ-КАНАЛА ----------------
 _TG_RSS_ENDPOINTS = [
     "https://rsshub.app/telegram/channel/{u}",
