@@ -347,12 +347,14 @@ def fetch_horoscope(sign_en: str) -> str:
     now = datetime.now(TZ)
     today = now.date()
 
-    # --- вспомогательные локальные функции ---
-    def cache_buster() -> str:
-        # меняется раз в час — этого обычно достаточно, чтобы пробить CDN
-        return now.strftime("%Y%m%d%H")
+    # ---------- helpers ----------
+    import random, difflib
 
-    def robust_get(url: str, lang: str = "ru", timeout: int = 12) -> Optional[str]:
+    def cache_buster() -> str:
+        # агрессивно бьём кэш: поминутно + случайный хвост
+        return now.strftime("%Y%m%d%H%M") + f"{random.randint(1000,9999)}"
+
+    def robust_get(url: str, lang: str = "ru", timeout: int = 12):
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -366,7 +368,7 @@ def fetch_horoscope(sign_en: str) -> str:
         }
         for _ in range(3):
             try:
-                r = requests.get(url, headers=headers, timeout=timeout)
+                r = requests.get(f"{url}?_cb={cache_buster()}", headers=headers, timeout=timeout)
                 if r.status_code == 200 and "<html" in r.text.lower():
                     return r.text
             except Exception:
@@ -396,7 +398,7 @@ def fetch_horoscope(sign_en: str) -> str:
         except Exception:
             return None
 
-    # === важное: ниже — ТОТ ЖЕ "жёсткий" парсер, что у тебя ===
+    # === твой «жёсткий» парсер (без изменений) ===
     junk_keywords = [
         "все знаки", "сегодня", "завтра", "неделя", "месяц", "любовь",
         "работа", "здоровье", "китайский", "персональный", "гороскоп 202",
@@ -416,10 +418,8 @@ def fetch_horoscope(sign_en: str) -> str:
             classes = " ".join(node.get("class", [])).lower()
             if any(k in classes for k in ("tags", "share", "social", "breadcrumbs", "related", "nav")):
                 continue
-
             links_count = len(node.find_all("a"))
             text = node.get_text(" ", strip=True)
-
             if not text:
                 continue
             if len(text) < 50:
@@ -431,12 +431,10 @@ def fetch_horoscope(sign_en: str) -> str:
                 continue
             if sum(1 for w in zodiac_words if w in tl) >= 4:
                 continue
-
             pieces.append(text)
             chars += len(text)
             if chars > 900 or len(pieces) >= 3:
                 break
-
         clean = " ".join(pieces).strip()
         if not clean:
             clean = "Не удалось извлечь текст гороскопа. Открой ссылку ниже."
@@ -444,9 +442,8 @@ def fetch_horoscope(sign_en: str) -> str:
             clean = clean[:1398].rstrip() + "…"
         return clean
 
-    def try_page(base_url: str, lang: str) -> Tuple[Optional[str], Optional[datetime], Optional[str]]:
-        url = f"{base_url}?_cb={cache_buster()}"
-        html = robust_get(url, lang=lang)
+    def fetch_page(base_url: str, lang: str) -> Tuple[Optional[str], Optional[datetime], Optional[str]]:
+        html = robust_get(base_url, lang=lang)
         if not html:
             return None, None, None
         soup = BeautifulSoup(html, "lxml")
@@ -454,40 +451,81 @@ def fetch_horoscope(sign_en: str) -> str:
         if not text:
             return None, None, None
         src_date = extract_date(soup.get_text(" ", strip=True), lang)
-        return text, src_date, base_url  # вернём базовый URL без _cb
+        return text, src_date, base_url
 
-    # --- кандидаты (ничего не меняем по доменам/пути) ---
+    # --- URL-ы ---
     RU_DAILY = f"https://ru.astrologyk.com/horoscope/daily/{slug}"
     EN_DAILY = f"https://astrologyk.com/horoscope/daily/{slug}"
     RU_TOMOR = f"https://ru.astrologyk.com/horoscope/tomorrow/{slug}"
     EN_TOMOR = f"https://astrologyk.com/horoscope/tomorrow/{slug}"
+    RU_YEST = f"https://ru.astrologyk.com/horoscope/yesterday/{slug}"
 
-    # 1) RU daily с пробитием кэша
-    txt, dt_src, src = try_page(RU_DAILY, "ru")
+    # --- эвристики «вчера» ---
+    def _normalize_for_compare(s: str) -> str:
+        s = re.sub(r'\s+', ' ', s.lower()).strip()
+        s = re.sub(r'[«»"“”„…—–\-—:;,.!?()\[\]]+', '', s)
+        return s
 
-    # 2) Если пусто или «вчера» (а в Праге уже утро) — EN daily (+перевод)
-    if (not txt) or (dt_src and dt_src.date() < today and now.hour >= 8):
-        t2, d2, s2 = try_page(EN_DAILY, "en")
+    def looks_like_yesterday(daily_text: str) -> bool:
+        try:
+            y_txt, _, _ = fetch_page(RU_YEST, "ru")
+            if not y_txt or not daily_text:
+                return False
+            # сравниваем первые 400 символов (после нормализации)
+            head_d = _normalize_for_compare(daily_text)[:400]
+            head_y = _normalize_for_compare(y_txt)[:400]
+            if not head_d or not head_y:
+                return False
+            if head_d == head_y:
+                return True
+            ratio = difflib.SequenceMatcher(a=head_d, b=head_y).ratio()
+            if ratio >= 0.88:
+                return True
+            # доп. метрика: Jaccard по словам
+            set_d = set(head_d.split())
+            set_y = set(head_y.split())
+            if set_d and (len(set_d & set_y) / len(set_d | set_y)) >= 0.8:
+                return True
+        except Exception:
+            return False
+        return False
+
+    # 1) RU /daily
+    txt, dt_src, src = fetch_page(RU_DAILY, "ru")
+
+    # 1a) если даты нет или дата < today — проверяем схожесть с /yesterday
+    stale = False
+    if txt:
+        if (dt_src and dt_src.date() < today) or (dt_src is None and looks_like_yesterday(txt)):
+            stale = True
+
+    # 2) если пусто или «вчера» — EN /daily (переведём в RU при наличии DEEPL_API_KEY)
+    if (not txt) or stale:
+        t2, d2, s2 = fetch_page(EN_DAILY, "en")
         if t2:
             txt = translate_to_ru(t2) or t2
             dt_src = d2 or dt_src
             src = s2 or src
+            # после замены ещё раз проверим «вчера» (англ. daily иногда тоже отстаёт)
+            if (dt_src and dt_src.date() < today) or (dt_src is None and looks_like_yesterday(txt)):
+                stale = True
+            else:
+                stale = False
 
-    # 3) Если всё ещё «вчера» после 10:00 — пробуем tomorrow (RU→EN при необходимости)
-    if txt and dt_src and dt_src.date() < today and now.hour >= 10:
-        t3, d3, s3 = try_page(RU_TOMOR, "ru")
+    # 3) если по-прежнему «вчера» — берём /tomorrow (RU; если нет — EN→перевод)
+    if txt and stale:
+        t3, d3, s3 = fetch_page(RU_TOMOR, "ru")
         if not t3:
-            t3, d3, s3 = try_page(EN_TOMOR, "en")
+            t3, d3, s3 = fetch_page(EN_TOMOR, "en")
             if t3:
                 t3 = translate_to_ru(t3) or t3
         if t3:
             txt, dt_src, src = t3, (d3 or dt_src), (s3 or src)
 
-    # 4) если так и не получилось — аккуратное сообщение
     if not txt:
         return "Гороскоп временно недоступен."
 
-    # финал: добавим источник и, если нашли, дату источника
+    # финал
     if dt_src:
         txt += f"\n\nИсточник: {src}\nДата источника: {dt_src.strftime('%d.%m.%Y')}"
     else:
