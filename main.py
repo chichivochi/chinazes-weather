@@ -347,32 +347,44 @@ def fetch_horoscope(sign_en: str) -> str:
     now = datetime.now(TZ)
     today = now.date()
 
-    # ---------- helpers ----------
     import random, difflib
 
-    def cache_buster() -> str:
-        # агрессивно бьём кэш: поминутно + случайный хвост
+    # ---------- helpers ----------
+    def _cb() -> str:
+        # агрессивный бьющий кэш суффикс
         return now.strftime("%Y%m%d%H%M") + f"{random.randint(1000,9999)}"
 
-    def robust_get(url: str, lang: str = "ru", timeout: int = 12):
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36"
-            ),
+    def _headers(lang: str = "ru") -> Dict[str, str]:
+        return {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36"),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7" if lang=="ru" else "en-US,en;q=0.9,ru;q=0.6",
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, max-age=0",
             "Pragma": "no-cache",
             "Referer": "https://www.google.com/",
         }
+
+    def http_get(url: str, lang: str = "ru", timeout: int = 12) -> Optional[str]:
         for _ in range(3):
             try:
-                r = requests.get(f"{url}?_cb={cache_buster()}", headers=headers, timeout=timeout)
+                r = requests.get(f"{url}?_cb={_cb()}", headers=_headers(lang), timeout=timeout, allow_redirects=True)
                 if r.status_code == 200 and "<html" in r.text.lower():
                     return r.text
             except Exception:
                 pass
+        return None
+
+    # proxy-reader (обходит упрямый кэш; возвращает ПЛОСКИЙ текст)
+    def http_readable(url: str, lang: str = "ru", timeout: int = 12) -> Optional[str]:
+        try:
+            # r.jina.ai требует http:// в целевом URL для корректного извлечения
+            target = url.replace("https://", "http://")
+            r = requests.get(f"https://r.jina.ai/{target}", headers=_headers(lang), timeout=timeout)
+            if r.ok and len((r.text or "").strip()) > 100:
+                return r.text
+        except Exception:
+            pass
         return None
 
     RU_MONTHS = {
@@ -384,7 +396,7 @@ def fetch_horoscope(sign_en: str) -> str:
          "september","october","november","december"], 1)}
 
     def extract_date(text: str, lang: str) -> Optional[datetime]:
-        tl = text.lower()
+        tl = (text or "").lower()
         if lang == "ru":
             m = re.search(r'(\d{1,2})\s+(' + "|".join(RU_MONTHS.keys()) + r')\s+(\d{4})', tl)
             if not m: return None
@@ -398,7 +410,7 @@ def fetch_horoscope(sign_en: str) -> str:
         except Exception:
             return None
 
-    # === твой «жёсткий» парсер (без изменений) ===
+    # === ТВОЙ ЖЁСТКИЙ ПАРСЕР — без изменений по правилам ===
     junk_keywords = [
         "все знаки", "сегодня", "завтра", "неделя", "месяц", "любовь",
         "работа", "здоровье", "китайский", "персональный", "гороскоп 202",
@@ -406,7 +418,8 @@ def fetch_horoscope(sign_en: str) -> str:
     zodiac_words = ["овен","телец","близнецы","рак","лев","дева","весы",
                     "скорпион","стрелец","козерог","водолей","рыбы"]
 
-    def pick_text_preserving_your_rules(soup: BeautifulSoup) -> str:
+    def pick_text_strict_from_html(html: str) -> str:
+        soup = BeautifulSoup(html, "lxml")
         container = (
             soup.find("article")
             or soup.find("div", class_=re.compile("entry-content|post|content"))
@@ -442,95 +455,118 @@ def fetch_horoscope(sign_en: str) -> str:
             clean = clean[:1398].rstrip() + "…"
         return clean
 
-    def fetch_page(base_url: str, lang: str) -> Tuple[Optional[str], Optional[datetime], Optional[str]]:
-        html = robust_get(base_url, lang=lang)
-        if not html:
-            return None, None, None
-        soup = BeautifulSoup(html, "lxml")
-        text = pick_text_preserving_your_rules(soup)
-        if not text:
-            return None, None, None
-        src_date = extract_date(soup.get_text(" ", strip=True), lang)
-        return text, src_date, base_url
+    def pick_text_strict_from_readable(text_plain: str) -> str:
+        # r.jina.ai отдаёт plain-text: имитируем твой парсер —
+        # разобьём по пустым строкам и применим те же «жёсткие» фильтры.
+        paras = [p.strip() for p in re.split(r"\n\s*\n", text_plain or "") if p.strip()]
+        pieces, chars = [], 0
+        for p in paras:
+            if len(p) < 50:
+                continue
+            tl = p.lower()
+            if sum(1 for w in junk_keywords if w in tl) >= 2:
+                continue
+            if sum(1 for w in zodiac_words if w in tl) >= 4:
+                continue
+            # ссылки считаем эвристически (кол-во 'http')
+            if tl.count("http") >= 3:
+                continue
+            pieces.append(p)
+            chars += len(p)
+            if chars > 900 or len(pieces) >= 3:
+                break
+        clean = " ".join(pieces).strip() or "Не удалось извлечь текст гороскопа. Открой ссылку ниже."
+        if len(clean) > 1400:
+            clean = clean[:1398].rstrip() + "…"
+        return clean
+
+    def fetch_page(base_url: str, lang: str, use_reader: bool = False) -> Tuple[Optional[str], Optional[datetime]]:
+        if not use_reader:
+            html = http_get(base_url, lang=lang)
+            if html:
+                text = pick_text_strict_from_html(html)
+                date_src = extract_date(BeautifulSoup(html, "lxml").get_text(" ", strip=True), lang)
+                return text, date_src
+        # fallback через ридер (свежий текст, даже когда CDN/403)
+        txt = http_readable(base_url, lang=lang)
+        if txt:
+            # дата для ридера берётся из самого текста
+            date_src = extract_date(txt, lang)
+            text = pick_text_strict_from_readable(txt)
+            return text, date_src
+        return None, None
+
+    def normalize_for_compare(s: str) -> str:
+        s = re.sub(r'\s+', ' ', (s or "").lower()).strip()
+        s = re.sub(r'[«»"“”„…—–\-—:;,.!?()\[\]]+', '', s)
+        return s
+
+    def looks_like_yesterday(daily_text: str, ru_y_url: str) -> bool:
+        y_txt, _ = fetch_page(ru_y_url, "ru")  # ридер сам включится при надобности
+        if not y_txt or not daily_text:
+            return False
+        head_d = normalize_for_compare(daily_text)[:500]
+        head_y = normalize_for_compare(y_txt)[:500]
+        if not head_d or not head_y:
+            return False
+        if head_d == head_y:
+            return True
+        ratio = difflib.SequenceMatcher(a=head_d, b=head_y).ratio()
+        if ratio >= 0.88:
+            return True
+        set_d, set_y = set(head_d.split()), set(head_y.split())
+        return bool(set_d) and (len(set_d & set_y) / len(set_d | set_y)) >= 0.80
 
     # --- URL-ы ---
     RU_DAILY = f"https://ru.astrologyk.com/horoscope/daily/{slug}"
     EN_DAILY = f"https://astrologyk.com/horoscope/daily/{slug}"
     RU_TOMOR = f"https://ru.astrologyk.com/horoscope/tomorrow/{slug}"
     EN_TOMOR = f"https://astrologyk.com/horoscope/tomorrow/{slug}"
-    RU_YEST = f"https://ru.astrologyk.com/horoscope/yesterday/{slug}"
+    RU_YEST  = f"https://ru.astrologyk.com/horoscope/yesterday/{slug}"
 
-    # --- эвристики «вчера» ---
-    def _normalize_for_compare(s: str) -> str:
-        s = re.sub(r'\s+', ' ', s.lower()).strip()
-        s = re.sub(r'[«»"“”„…—–\-—:;,.!?()\[\]]+', '', s)
-        return s
-
-    def looks_like_yesterday(daily_text: str) -> bool:
-        try:
-            y_txt, _, _ = fetch_page(RU_YEST, "ru")
-            if not y_txt or not daily_text:
-                return False
-            # сравниваем первые 400 символов (после нормализации)
-            head_d = _normalize_for_compare(daily_text)[:400]
-            head_y = _normalize_for_compare(y_txt)[:400]
-            if not head_d or not head_y:
-                return False
-            if head_d == head_y:
-                return True
-            ratio = difflib.SequenceMatcher(a=head_d, b=head_y).ratio()
-            if ratio >= 0.88:
-                return True
-            # доп. метрика: Jaccard по словам
-            set_d = set(head_d.split())
-            set_y = set(head_y.split())
-            if set_d and (len(set_d & set_y) / len(set_d | set_y)) >= 0.8:
-                return True
-        except Exception:
-            return False
-        return False
-
-    # 1) RU /daily
-    txt, dt_src, src = fetch_page(RU_DAILY, "ru")
-
-    # 1a) если даты нет или дата < today — проверяем схожесть с /yesterday
+    # 1) RU /daily (сначала обычный HTML; если старьё — reader)
+    txt, dt_src = fetch_page(RU_DAILY, "ru")
     stale = False
     if txt:
-        if (dt_src and dt_src.date() < today) or (dt_src is None and looks_like_yesterday(txt)):
+        if (dt_src and dt_src.date() < today) or (dt_src is None and looks_like_yesterday(txt, RU_YEST)):
+            # попробуем свежак через reader принудительно
+            txt_r, dt_r = fetch_page(RU_DAILY, "ru", use_reader=True)
+            if txt_r:
+                txt, dt_src = txt_r, (dt_r or dt_src)
+        # снова проверим на «вчера»
+        if (dt_src and dt_src.date() < today) or (dt_src is None and looks_like_yesterday(txt, RU_YEST)):
             stale = True
 
-    # 2) если пусто или «вчера» — EN /daily (переведём в RU при наличии DEEPL_API_KEY)
+    # 2) Если пусто или «вчера» — EN /daily (reader при необходимости) и перевод
     if (not txt) or stale:
-        t2, d2, s2 = fetch_page(EN_DAILY, "en")
+        t2, d2 = fetch_page(EN_DAILY, "en")
         if t2:
             txt = translate_to_ru(t2) or t2
             dt_src = d2 or dt_src
-            src = s2 or src
-            # после замены ещё раз проверим «вчера» (англ. daily иногда тоже отстаёт)
-            if (dt_src and dt_src.date() < today) or (dt_src is None and looks_like_yesterday(txt)):
-                stale = True
-            else:
-                stale = False
+            stale = (dt_src and dt_src.date() < today) or (dt_src is None and looks_like_yesterday(txt, RU_YEST))
+        else:
+            stale = True  # EN тоже не дал текста → пойдём на tomorrow
 
-    # 3) если по-прежнему «вчера» — берём /tomorrow (RU; если нет — EN→перевод)
-    if txt and stale:
-        t3, d3, s3 = fetch_page(RU_TOMOR, "ru")
+    # 3) Если всё ещё «вчера»/пусто — RU /tomorrow (reader при необходимости), иначе EN /tomorrow (+перевод)
+    if (not txt) or stale:
+        t3, d3 = fetch_page(RU_TOMOR, "ru")
         if not t3:
-            t3, d3, s3 = fetch_page(EN_TOMOR, "en")
+            t3, d3 = fetch_page(EN_TOMOR, "en")
             if t3:
                 t3 = translate_to_ru(t3) or t3
         if t3:
-            txt, dt_src, src = t3, (d3 or dt_src), (s3 or src)
+            txt, dt_src = t3, (d3 or dt_src)
 
     if not txt:
         return "Гороскоп временно недоступен."
 
     # финал
+    src_line = RU_DAILY  # основной источник
     if dt_src:
-        txt += f"\n\nИсточник: {src}\nДата источника: {dt_src.strftime('%d.%m.%Y')}"
+        txt += f"\n\nИсточник: {src_line}\nДата источника: {dt_src.strftime('%d.%m.%Y')}"
     else:
-        txt += f"\n\nИсточник: {src}"
-    return txt
+        txt += f"\n\nИсточник: {src_line}"
+    return txt    
     
 # ---------------- НОВОСТИ: 3 ПОСЛЕДНИХ ПОСТА ИЗ ТГ-КАНАЛА ----------------
 _TG_RSS_ENDPOINTS = [
